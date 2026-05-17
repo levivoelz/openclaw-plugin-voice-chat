@@ -1,7 +1,13 @@
 /**
  * Per-WS-connection voice session orchestrator. Owns the STT session, the
- * agent bridge, the sentence buffer, and the active TTS stream. Implemented
- * as a small state machine to handle interrupts cleanly.
+ * agent dispatch, the sentence buffer, and the active TTS stream. Implemented
+ * as a small state machine so interrupts are clean.
+ *
+ * As a channel plugin, every final transcript becomes a real user turn via
+ * `runtime.channel.turn.runPrepared` + `dispatchReplyWithBufferedBlockDispatcher`.
+ * The reply pipeline calls our `deliver` per block (sentence) because the
+ * plugin advertises `blockStreaming: true` — without that, deliver fires
+ * once with the entire reply.
  */
 
 import { randomUUID } from "node:crypto";
@@ -16,10 +22,11 @@ import type {
 import { SentenceBuffer } from "./sentence-buffer.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { SttSession } from "../providers/stt/types.js";
-import type { AgentBridge } from "./agent-bridge.js";
+import { getVoiceChatRuntime } from "../channel-runtime.js";
 
 // 24 kHz: minimum accepted by OpenAI Realtime, also fine for Whisper.
 const SAMPLE_RATE = 24_000;
+const CHANNEL_ID = "voice-chat";
 
 type Logger = {
   info: (m: string) => void;
@@ -32,10 +39,15 @@ export type VoiceSessionDeps = {
   ws: WebSocket;
   sessionKey: string;
   agentId: string;
+  /** Stable id for this voice client; doubles as the peer id for routing. */
+  clientId: string;
+  /** Channel account id (currently always "default"). */
+  accountId: string;
+  /** Full host config — we pass it through to the channel reply pipeline. */
+  cfg: unknown;
   config: ResolvedVoiceConfig;
   registry: ProviderRegistry;
   pluginConfig: Record<string, unknown>;
-  agent: AgentBridge;
   logger: Logger;
 };
 
@@ -46,9 +58,9 @@ export class VoiceSession {
   private sentenceBuf: SentenceBuffer | null = null;
   private currentTurnId: string | null = null;
   private ttsAbort: AbortController | null = null;
-  private agentUnsub: (() => void) | null = null;
   private closed = false;
   private ttsSeqByTurn = new Map<string, number>();
+  private pendingTurn: Promise<void> | null = null;
 
   constructor(deps: VoiceSessionDeps) {
     this.ws = deps.ws;
@@ -143,6 +155,17 @@ export class VoiceSession {
     this.stt?.sendAudio(audio);
   }
 
+  /**
+   * Push a sentence-sized chunk of agent text into TTS. With blockStreaming
+   * the reply pipeline already gives us sentence-sized blocks; we send each
+   * one straight to the buffer so any short residual gets coalesced and any
+   * over-long block gets split.
+   */
+  deliverAgentText(text: string, turnId: string): void {
+    this.send({ type: "agent.delta", text, turnId });
+    this.sentenceBuf?.push(text);
+  }
+
   private async onFinalTranscript(text: string): Promise<void> {
     if (this.closed) return;
     const trimmed = text.trim();
@@ -153,40 +176,101 @@ export class VoiceSession {
     this.ttsSeqByTurn.set(turnId, 0);
     this.send({ type: "transcript.final", text: trimmed, turnId });
 
-    let handle: { turnId: string };
-    try {
-      handle = await this.d.agent.injectUserTurn({
-        sessionKey: this.d.sessionKey,
-        agentId: this.d.agentId,
-        content: trimmed,
-        source: { plugin: "voice-chat", channel: "voice", turnId },
-      });
-    } catch (e) {
-      const err = e as Error;
-      this.sendError("INJECT_FAILED", `Failed to inject voice turn: ${err.message}`);
-      return;
-    }
-
     const ttsProv = this.d.registry.getTts(this.d.config.tts.provider)!;
     this.ttsAbort = new AbortController();
     const ttsAbort = this.ttsAbort;
 
     this.sentenceBuf = new SentenceBuffer((chunk) => {
-      void this.speak(chunk, handle.turnId, ttsProv, ttsAbort.signal);
+      void this.speak(chunk, turnId, ttsProv, ttsAbort.signal);
     });
 
-    this.agentUnsub?.();
-    this.agentUnsub = this.d.agent.subscribe({ turnId: handle.turnId, cancel: async () => {} }, {
-      onDelta: (delta) => {
-        this.send({ type: "agent.delta", text: delta, turnId: handle.turnId });
-        this.sentenceBuf?.push(delta);
-      },
-      onDone: (usage) => {
-        this.sentenceBuf?.flush();
-        this.send({ type: "agent.done", turnId: handle.turnId, usage });
-      },
-      onError: (err) => {
-        this.sendError("AGENT_ERROR", err.message, true);
+    try {
+      this.pendingTurn = this.runChannelTurn(trimmed, turnId);
+      await this.pendingTurn;
+      this.sentenceBuf?.flush();
+      this.send({ type: "agent.done", turnId });
+    } catch (e) {
+      const err = e as Error;
+      this.d.logger.error(`voice-chat: agent turn failed: ${err.message}`);
+      this.sendError("AGENT_ERROR", err.message, true);
+    } finally {
+      this.pendingTurn = null;
+    }
+  }
+
+  /**
+   * Drive a single turn through the host's channel reply pipeline. The
+   * resolved-route + finalize-context + runPrepared sequence mirrors what
+   * clickclack and other channel plugins do; only `deliver` differs (we
+   * stream blocks to TTS instead of posting to an upstream API).
+   */
+  private async runChannelTurn(transcript: string, turnId: string): Promise<void> {
+    const runtime = getVoiceChatRuntime() as RuntimeShape;
+    const cfg = this.d.cfg;
+
+    const route = runtime.channel.routing.resolveAgentRoute({
+      cfg,
+      channel: CHANNEL_ID,
+      accountId: this.d.accountId,
+      peer: { kind: "direct", id: this.d.clientId },
+    });
+
+    const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+      Body: transcript,
+      BodyForAgent: transcript,
+      RawBody: transcript,
+      CommandBody: transcript,
+      From: this.d.clientId,
+      To: this.d.clientId,
+      SessionKey: route.sessionKey,
+      AccountId: this.d.accountId,
+      ChatType: "direct",
+      Provider: CHANNEL_ID,
+      Surface: CHANNEL_ID,
+      CommandAuthorized: true,
+    });
+
+    const { onModelSelected, ...replyPipeline } = runtime.channel.reply.createChannelReplyPipeline({
+      cfg,
+      agentId: route.agentId,
+      channel: CHANNEL_ID,
+      accountId: this.d.accountId,
+    });
+
+    await runtime.channel.turn.runPrepared({
+      channel: CHANNEL_ID,
+      accountId: this.d.accountId,
+      routeSessionKey: route.sessionKey,
+      storePath: runtime.channel.session.resolveStorePath(
+        (cfg as { session?: { store?: unknown } } | undefined)?.session?.store,
+        { agentId: route.agentId },
+      ),
+      ctxPayload,
+      recordInboundSession: runtime.channel.session.recordInboundSession,
+      runDispatch: async () =>
+        runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx: ctxPayload,
+          cfg,
+          dispatcherOptions: {
+            ...replyPipeline,
+            deliver: async (payload: unknown) => {
+              const text =
+                payload && typeof payload === "object" && "text" in (payload as Record<string, unknown>)
+                  ? String((payload as { text?: unknown }).text ?? "")
+                  : "";
+              if (!text.trim()) return;
+              this.deliverAgentText(text, turnId);
+            },
+            onError: (err: unknown) => {
+              throw err instanceof Error ? err : new Error(String(err));
+            },
+          },
+          replyOptions: { onModelSelected },
+        }),
+      record: {
+        onRecordError: (err: unknown) => {
+          throw err instanceof Error ? err : new Error(String(err));
+        },
       },
     });
   }
@@ -247,8 +331,6 @@ export class VoiceSession {
     if (this.closed) return;
     this.closed = true;
     this.interruptTts();
-    this.agentUnsub?.();
-    this.agentUnsub = null;
     void this.stt?.close();
     this.stt = null;
     if (this.ws.readyState === this.ws.OPEN || this.ws.readyState === this.ws.CONNECTING) {
@@ -256,3 +338,52 @@ export class VoiceSession {
     }
   }
 }
+
+/**
+ * Loose runtime shape — we don't have a stable importable type for the host
+ * channel runtime surface, and faithfully typing it would drag in the entire
+ * SDK. We declare the minimum we touch and trust the host contract.
+ */
+type RuntimeShape = {
+  channel: {
+    routing: {
+      resolveAgentRoute: (args: {
+        cfg: unknown;
+        channel: string;
+        accountId: string;
+        peer: { kind: string; id: string };
+      }) => { agentId: string; sessionKey: string; accountId?: string };
+    };
+    reply: {
+      finalizeInboundContext: (payload: Record<string, unknown>) => Record<string, unknown>;
+      createChannelReplyPipeline: (args: {
+        cfg: unknown;
+        agentId: string;
+        channel: string;
+        accountId: string;
+      }) => { onModelSelected: unknown; [key: string]: unknown };
+      dispatchReplyWithBufferedBlockDispatcher: (args: {
+        ctx: unknown;
+        cfg: unknown;
+        dispatcherOptions: Record<string, unknown>;
+        replyOptions: Record<string, unknown>;
+      }) => Promise<void>;
+    };
+    session: {
+      resolveStorePath: (store: unknown, args: { agentId: string }) => unknown;
+      recordInboundSession: unknown;
+    };
+    turn: {
+      runPrepared: (args: {
+        channel: string;
+        accountId: string;
+        routeSessionKey: string;
+        storePath: unknown;
+        ctxPayload: unknown;
+        recordInboundSession: unknown;
+        runDispatch: () => Promise<unknown>;
+        record: { onRecordError: (err: unknown) => void };
+      }) => Promise<void>;
+    };
+  };
+};

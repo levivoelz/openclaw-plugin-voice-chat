@@ -3,7 +3,7 @@
   "name": "Voice Chat",
   "description": "Voice that behaves like chat. STT and TTS bracket the real OpenClaw agent so it inherits your configured models, memory, skills, and permissions.",
   "version": "0.1.0",
-  "kind": "tool",
+  "channels": ["voice-chat"],
   "contracts": {
     "realtimeTranscriptionProviders": [
       "voice-chat/openai-realtime",
@@ -58,49 +58,62 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {
-      "stt": {
+    "properties": {}
+  },
+  "channelConfigs": {
+    "voice-chat": {
+      "label": "Voice Chat",
+      "description": "STT + TTS bracketing for OpenClaw chat sessions.",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "provider": { "type": "string", "default": "voice-chat/openai-whisper" },
-          "model":    { "type": "string", "default": "whisper-1" },
-          "language": { "type": "string" }
-        }
-      },
-      "tts": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "provider": { "type": "string", "default": "voice-chat/openai" },
-          "model":    { "type": "string", "default": "tts-1" },
-          "voice":    { "type": "string", "default": "alloy" },
-          "format":   { "type": "string", "enum": ["mp3", "pcm16", "opus"], "default": "mp3" }
-        }
-      },
-      "openai": {
-        "type": "object",
-        "properties": {
-          "apiKey":  { "type": "string" },
-          "baseUrl": { "type": "string" }
-        }
-      },
-      "elevenlabs": {
-        "type": "object",
-        "properties": {
-          "apiKey": { "type": "string" }
-        }
-      },
-      "interrupt": { "type": "boolean", "default": true },
-      "mode":      { "type": "string", "enum": ["ptt", "vad"], "default": "ptt" },
-      "perAgent": {
-        "type": "object",
-        "description": "Per-agent overrides keyed by agent id.",
-        "additionalProperties": {
-          "type": "object",
-          "properties": {
-            "stt": { "type": "object" },
-            "tts": { "type": "object" }
+          "enabled": { "type": "boolean", "default": true },
+          "stt": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "default": "voice-chat/openai-whisper" },
+              "model":    { "type": "string", "default": "whisper-1" },
+              "language": { "type": "string" }
+            }
+          },
+          "tts": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "default": "voice-chat/openai" },
+              "model":    { "type": "string", "default": "tts-1" },
+              "voice":    { "type": "string", "default": "alloy" },
+              "format":   { "type": "string", "enum": ["mp3", "pcm16", "opus"], "default": "mp3" }
+            }
+          },
+          "openai": {
+            "type": "object",
+            "properties": {
+              "apiKey":  { "type": "string" },
+              "baseUrl": { "type": "string" }
+            }
+          },
+          "elevenlabs": {
+            "type": "object",
+            "properties": {
+              "apiKey": { "type": "string" }
+            }
+          },
+          "interrupt": { "type": "boolean", "default": true },
+          "mode":      { "type": "string", "enum": ["ptt", "vad"], "default": "ptt" },
+          "perAgent": {
+            "type": "object",
+            "description": "Per-agent overrides keyed by agent id.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "stt": { "type": "object" },
+                "tts": { "type": "object" }
+              }
+            }
           }
         }
       }
