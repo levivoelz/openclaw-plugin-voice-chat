@@ -13,7 +13,7 @@
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/core";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi, OpenClawPluginHttpRouteParams } from "openclaw/plugin-sdk";
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { ProviderRegistry } from "./providers/registry.js";
@@ -29,12 +29,18 @@ import { VOICE_WS_PATH, type ClientFrame, type VoiceConnectParams, isClientFrame
 
 const PLUGIN_ID = "voice-chat";
 
+// Type for the parts of OpenClawPluginApi we call directly.
+type ApiWithDirectMethods = OpenClawPluginApi & {
+  registerHttpRoute(params: OpenClawPluginHttpRouteParams): void;
+  registerService(service: { id: string; start?: () => void; stop?: () => void }): void;
+};
+
 export default definePluginEntry({
   id: PLUGIN_ID,
   name: "Voice Chat",
   description: "Voice that behaves like chat. STT and TTS bracket the real OpenClaw agent.",
   register(api) {
-    const apiAny = api as OpenClawPluginApi & Record<string, unknown>;
+    const apiAny = api as ApiWithDirectMethods;
     const logger = apiAny.logger ?? consoleLogger();
 
     const registry = new ProviderRegistry();
@@ -106,14 +112,21 @@ export default definePluginEntry({
       });
     });
 
-    // Register the HTTP/WS route. Try multiple SDK shapes.
-    const registered = registerHttpUpgrade(apiAny, VOICE_WS_PATH, wss);
-    if (!registered) {
-      logger.warn(
-        `voice-chat: could not register HTTP upgrade for ${VOICE_WS_PATH}. ` +
-        `Falling back to plugin-level WS server is not yet implemented; voice clients will not be reachable.`,
-      );
-    }
+    // Register the HTTP/WS route — direct call with required auth field.
+    apiAny.registerHttpRoute({
+      path: VOICE_WS_PATH,
+      auth: "gateway",
+      handler: (_req, res) => { res.writeHead(426, "Upgrade Required").end(); },
+      handleUpgrade: (req, socket, head) => {
+        if (req.url?.startsWith(VOICE_WS_PATH)) {
+          wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit("connection", ws, req);
+          });
+        } else {
+          socket.destroy();
+        }
+      },
+    });
 
     // Session action — "Talk" button on every chat session.
     tryRegisterSessionAction(apiAny, {
@@ -141,7 +154,7 @@ export default definePluginEntry({
     }, logger);
 
     // Long-running service — exposes the active session map for debugging.
-    tryRegisterService(apiAny, {
+    apiAny.registerService({
       id: "voice-chat",
       start: () => { /* WebSocketServer already running */ },
       stop: () => {
@@ -149,13 +162,7 @@ export default definePluginEntry({
         sessions.clear();
         wss.close();
       },
-    }, logger);
-
-    // CLI bin (optional) — wired up so `openclaw doctor` can probe the plugin.
-    tryRegisterCli(apiAny, (ctx: { program: unknown }) => {
-      const program = ctx.program as { command?: (n: string) => unknown } | null;
-      program?.command?.("voice-chat:doctor");
-    }, logger);
+    });
 
     logger.info(`voice-chat: ready (${registry.listStt().length} STT, ${registry.listTts().length} TTS providers)`);
   },
@@ -185,35 +192,6 @@ function cryptoRandomId(): string {
 
 type Logger = ReturnType<typeof consoleLogger>;
 
-function registerHttpUpgrade(api: Record<string, unknown>, path: string, wss: WebSocketServer): boolean {
-  // Several candidate SDK shapes — try them in order.
-  const tryUpgrade = (handler: (req: IncomingMessage, socket: import("net").Socket, head: Buffer) => void) => {
-    const candidates: Array<[string[], unknown]> = [];
-    walk(api, [], 3, candidates);
-    for (const [keyPath, fn] of candidates) {
-      const name = keyPath.join(".");
-      if (typeof fn !== "function") continue;
-      if (/registerHttpUpgrade$|registerWebSocketRoute$|registerHttpRoute$|http\.registerRoute$|http\.registerUpgrade$/.test(name)) {
-        try {
-          (fn as (opts: unknown) => void).call(api, { path, handler, upgrade: "websocket", method: "GET" });
-          return true;
-        } catch { /* try next */ }
-      }
-    }
-    return false;
-  };
-
-  return tryUpgrade((req, socket, head) => {
-    if (req.url?.startsWith(path)) {
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, req);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
-}
-
 function tryRegisterSessionAction(api: Record<string, unknown>, action: unknown, logger: Logger): void {
   const fn = pickFn(api, [
     ["session", "actions", "register"],
@@ -240,24 +218,6 @@ function tryRegisterControlUi(api: Record<string, unknown>, descriptor: unknown,
   try { fn.call(api, descriptor); } catch (e) { logger.warn(`voice-chat: control UI registration failed: ${(e as Error).message}`); }
 }
 
-function tryRegisterService(api: Record<string, unknown>, service: { id: string; start?: () => void; stop?: () => void }, logger: Logger): void {
-  const fn = pickFn(api, [
-    ["registerService"],
-    ["services", "register"],
-  ]);
-  if (!fn) {
-    logger.debug("voice-chat: registerService not present (service lifecycle skipped)");
-    return;
-  }
-  try { fn.call(api, service); } catch (e) { logger.warn(`voice-chat: service registration failed: ${(e as Error).message}`); }
-}
-
-function tryRegisterCli(api: Record<string, unknown>, handler: (ctx: { program: unknown }) => void, logger: Logger): void {
-  const fn = pickFn(api, [["registerCli"]]);
-  if (!fn) return;
-  try { fn.call(api, handler); } catch (e) { logger.debug(`voice-chat: registerCli failed: ${(e as Error).message}`); }
-}
-
 function pickFn(root: unknown, paths: string[][]): Function | null {
   for (const path of paths) {
     let cur: unknown = root;
@@ -272,11 +232,3 @@ function pickFn(root: unknown, paths: string[][]): Function | null {
   return null;
 }
 
-function walk(obj: unknown, path: string[], depth: number, out: Array<[string[], unknown]>): void {
-  if (!obj || typeof obj !== "object" || depth < 0) return;
-  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    const p = [...path, k];
-    out.push([p, v]);
-    if (typeof v === "object" && v !== null && depth > 0) walk(v, p, depth - 1, out);
-  }
-}

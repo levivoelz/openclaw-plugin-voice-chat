@@ -9,6 +9,9 @@
  */
 
 declare module "openclaw/plugin-sdk" {
+  import type { IncomingMessage, ServerResponse } from "node:http";
+  import type { Socket } from "node:net";
+
   export interface OpenClawLogger {
     info: (msg: string) => void;
     warn: (msg: string) => void;
@@ -16,10 +19,42 @@ declare module "openclaw/plugin-sdk" {
     debug: (msg: string) => void;
   }
 
+  export type OpenClawPluginHttpRouteAuth = "gateway" | "plugin";
+
+  export type OpenClawPluginHttpRouteHandler = (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ) => Promise<boolean | void> | boolean | void;
+
+  export type OpenClawPluginHttpRouteUpgradeHandler = (
+    req: IncomingMessage,
+    socket: Socket,
+    head: Buffer,
+  ) => void;
+
+  export interface OpenClawPluginHttpRouteParams {
+    path: string;
+    handler: OpenClawPluginHttpRouteHandler;
+    handleUpgrade?: OpenClawPluginHttpRouteUpgradeHandler;
+    auth: OpenClawPluginHttpRouteAuth;
+    match?: "exact" | "prefix";
+    gatewayRuntimeScopeSurface?: "write-default" | "trusted-operator";
+    nodeCapability?: { surface: string; ttlMs?: number };
+    replaceExisting?: boolean;
+  }
+
+  export interface OpenClawPluginService {
+    id: string;
+    start?: () => void;
+    stop?: () => void;
+  }
+
   export interface OpenClawPluginApi {
     pluginConfig?: unknown;
     config?: unknown;
     logger?: OpenClawLogger;
+    registerHttpRoute(params: OpenClawPluginHttpRouteParams): void;
+    registerService(service: OpenClawPluginService): void;
     // Anything else is duck-typed; we feature-detect at runtime.
     [key: string]: unknown;
   }
