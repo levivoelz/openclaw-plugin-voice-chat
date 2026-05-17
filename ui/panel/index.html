@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Chat</title>
+  <link rel="stylesheet" href="./panel.css" />
+</head>
+<body>
+  <div id="root">
+    <header id="hdr">
+      <span id="status-dot" class="dot dot--idle" title="idle"></span>
+      <span id="status-label">Voice Chat</span>
+      <button id="settings-btn" class="icon-btn" title="Settings" aria-label="Settings">&#9881;</button>
+    </header>
+
+    <div id="meter-wrap" aria-hidden="true">
+      <div id="meter-bar"></div>
+    </div>
+
+    <div id="transcript-area" aria-live="polite" aria-label="Transcript">
+      <p id="partial-line" class="partial"></p>
+    </div>
+
+    <div id="response-area" aria-live="polite" aria-label="Agent response">
+      <p id="response-text"></p>
+    </div>
+
+    <footer id="controls">
+      <button id="interrupt-btn" class="icon-btn" title="Interrupt (Esc)" aria-label="Interrupt" disabled>&#9632;</button>
+      <button id="mic-btn" aria-label="Hold to talk" aria-pressed="false">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M12 1a4 4 0 0 1 4 4v7a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm7 11a7 7 0 0 1-14 0H3a9 9 0 0 0 18 0h-2zM11 23h2v-2.07A9 9 0 0 0 21 12h-2a7 7 0 0 1-14 0H3a9 9 0 0 0 8 8.93V23z"/>
+        </svg>
+      </button>
+      <div id="mode-toggle" role="group" aria-label="Capture mode">
+        <label title="Push to Talk"><input type="radio" name="mode" value="ptt" checked /> PTT</label>
+        <label title="Voice Activity Detection"><input type="radio" name="mode" value="vad" /> VAD</label>
+      </div>
+    </footer>
+  </div>
+  <script type="module" src="./panel.js"></script>
+</body>
+</html>

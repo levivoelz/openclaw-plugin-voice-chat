@@ -1,0 +1,60 @@
+{
+  "name": "@levivoelz/openclaw-plugin-voice-chat",
+  "version": "0.1.0",
+  "description": "Voice that behaves like chat for OpenClaw — STT/TTS bracket your real OpenClaw agent.",
+  "type": "module",
+  "main": "./dist/plugin.js",
+  "types": "./dist/plugin.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    },
+    "./protocol": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
+  "bin": {
+    "openclaw-voice": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "ui",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --import tsx test/**/*.test.ts",
+    "clean": "rm -rf dist"
+  },
+  "openclaw": {
+    "extensions": ["./dist/plugin.js"],
+    "compat": {
+      "minGatewayVersion": "2026.5.12"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.12"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": { "optional": true }
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": ["openclaw", "openclaw-plugin", "voice", "stt", "tts", "realtime"],
+  "license": "MIT"
+}

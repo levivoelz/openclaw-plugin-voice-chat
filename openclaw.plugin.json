@@ -1,0 +1,109 @@
+{
+  "id": "voice-chat",
+  "name": "Voice Chat",
+  "description": "Voice that behaves like chat. STT and TTS bracket the real OpenClaw agent so it inherits your configured models, memory, skills, and permissions.",
+  "version": "0.1.0",
+  "kind": "tool",
+  "contracts": {
+    "realtimeTranscriptionProviders": [
+      "voice-chat/openai-realtime",
+      "voice-chat/openai-whisper"
+    ],
+    "speechProviders": [
+      "voice-chat/openai",
+      "voice-chat/elevenlabs",
+      "voice-chat/macos-say"
+    ]
+  },
+  "activation": { "onStartup": true },
+  "uiHints": {
+    "stt.provider": {
+      "label": "Default STT provider",
+      "help": "Speech-to-text provider id. Any plugin can register more; this picks the default."
+    },
+    "stt.model": {
+      "label": "Default STT model",
+      "help": "Model id within the chosen STT provider."
+    },
+    "tts.provider": {
+      "label": "Default TTS provider"
+    },
+    "tts.model": {
+      "label": "Default TTS model"
+    },
+    "tts.voice": {
+      "label": "Default TTS voice"
+    },
+    "openai.apiKey": {
+      "label": "OpenAI API key",
+      "sensitive": true,
+      "placeholder": "sk-...",
+      "help": "Used by the openai STT/TTS providers if no per-provider key is set."
+    },
+    "elevenlabs.apiKey": {
+      "label": "ElevenLabs API key",
+      "sensitive": true,
+      "placeholder": "sk_...",
+      "help": "Required only if you select the elevenlabs TTS provider."
+    },
+    "interrupt": {
+      "label": "Interrupt TTS when user speaks",
+      "help": "Cancel in-flight TTS playback as soon as the user starts a new utterance."
+    },
+    "mode": {
+      "label": "Default capture mode",
+      "help": "'ptt' = push-to-talk, 'vad' = voice-activity detection."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "stt": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": { "type": "string", "default": "voice-chat/openai-whisper" },
+          "model":    { "type": "string", "default": "whisper-1" },
+          "language": { "type": "string" }
+        }
+      },
+      "tts": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": { "type": "string", "default": "voice-chat/openai" },
+          "model":    { "type": "string", "default": "tts-1" },
+          "voice":    { "type": "string", "default": "alloy" },
+          "format":   { "type": "string", "enum": ["mp3", "pcm16", "opus"], "default": "mp3" }
+        }
+      },
+      "openai": {
+        "type": "object",
+        "properties": {
+          "apiKey":  { "type": "string" },
+          "baseUrl": { "type": "string" }
+        }
+      },
+      "elevenlabs": {
+        "type": "object",
+        "properties": {
+          "apiKey": { "type": "string" }
+        }
+      },
+      "interrupt": { "type": "boolean", "default": true },
+      "mode":      { "type": "string", "enum": ["ptt", "vad"], "default": "ptt" },
+      "perAgent": {
+        "type": "object",
+        "description": "Per-agent overrides keyed by agent id.",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "stt": { "type": "object" },
+            "tts": { "type": "object" }
+          }
+        }
+      }
+    }
+  }
+}
