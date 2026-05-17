@@ -53,7 +53,9 @@ const descriptor: TtsProviderDescriptor = {
   id: "voice-chat/elevenlabs",
   label: "ElevenLabs (via daemon)",
   streaming: false,
-  models: ["eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_flash_v2_5"],
+  // Flash v2.5 listed first as the recommended low-latency default for users
+  // who opt into elevenlabs; provider default kept as turbo for compatibility.
+  models: ["eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2"],
   defaultModel: "eleven_turbo_v2_5",
   voices: listVoices,
   defaultVoice: "21m00Tcm4TlvDq8ikWAM",

@@ -12,7 +12,10 @@ import { resolveClientId } from "./client-id.js";
 const ANSI_DIM    = "\x1b[2m";
 const ANSI_RESET  = "\x1b[0m";
 
-const QUICK_START_BYTES = 50 * 1024; // begin playback after 50 KB buffered
+// 8KB ≈ a few hundred ms of MP3 at 24kbps — playback starts on the first
+// chunk that crosses this size. Lower = snappier first-audio, higher = more
+// resistant to brief stalls. 50KB used to push first-audio out ~300–400ms.
+const QUICK_START_BYTES = 8 * 1024;
 
 type AudioMod = typeof import("./audio-mac.js");
 

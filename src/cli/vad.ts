@@ -14,7 +14,7 @@ export type VadOptions = {
   threshold?: number;
   /** Ms of above-threshold audio before SPEECH state begins. Default 150. */
   speechOnsetMs?: number;
-  /** Ms of below-threshold audio before SPEECH state ends. Default 800. */
+  /** Ms of below-threshold audio before SPEECH state ends. Default 400. */
   speechOffsetMs?: number;
   /** Drop utterances shorter than this. STT models hallucinate badly on
    *  sub-speech clips; 600 ms ≈ a single short word minimum. Default 600. */

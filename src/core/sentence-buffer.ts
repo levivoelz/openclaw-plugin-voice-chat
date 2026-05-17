@@ -18,9 +18,13 @@ export type SentenceBufferOptions = {
 
 const DEFAULTS: Required<SentenceBufferOptions> = {
   maxChunkChars: 400,
-  firstChunkMinChars: 24,
+  // Fire the first TTS request as soon as ~12 chars + a boundary land. The
+  // first synth call is the long-pole on perceived latency; smaller first
+  // chunk = audio starts playing sooner. Subsequent chunks stay larger to
+  // amortize per-call cost.
+  firstChunkMinChars: 12,
   subsequentChunkMinChars: 80,
-  idleFlushMs: 350,
+  idleFlushMs: 250,
 };
 
 // Sentence-ish boundary: end punctuation followed by space/newline, OR a
