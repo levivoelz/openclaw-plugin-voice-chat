@@ -30,6 +30,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { ProviderRegistry } from "./providers/registry.js";
 import { registerOpenaiRealtimeStt } from "./providers/stt/openai-realtime.js";
 import { registerOpenaiWhisperStt } from "./providers/stt/openai-whisper.js";
+import { registerParakeetLocalStt } from "./providers/stt/parakeet-local.js";
 import { registerOpenaiTts } from "./providers/tts/openai.js";
 import { registerElevenlabsTts } from "./providers/tts/elevenlabs.js";
 import { registerMacosSayTts } from "./providers/tts/macos-say.js";
@@ -60,6 +61,7 @@ const activeSessions = new Set<VoiceSession>();
 
 // Provider registry is process-wide; safe to populate eagerly.
 const registry = new ProviderRegistry();
+registerParakeetLocalStt(registry);
 registerOpenaiRealtimeStt(registry);
 registerOpenaiWhisperStt(registry);
 registerOpenaiTts(registry);

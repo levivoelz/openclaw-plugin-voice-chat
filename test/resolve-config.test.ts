@@ -18,7 +18,7 @@ test("hints override per-agent override override base defaults", () => {
 test("falls back to built-in defaults when nothing is configured", () => {
   const r = resolveVoiceConfig({ pluginConfig: {}, agentId: "default" });
   assert.equal(r.tts.provider, "voice-chat/openai");
-  assert.equal(r.stt.provider, "voice-chat/openai-whisper");
+  assert.equal(r.stt.provider, "voice-chat/parakeet-local");
   assert.equal(r.mode, "ptt");
   assert.equal(r.interrupt, true);
 });

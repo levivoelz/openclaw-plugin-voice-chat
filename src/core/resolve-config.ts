@@ -17,7 +17,7 @@ export type PluginConfigShape = {
 };
 
 const DEFAULTS = {
-  stt: { provider: "voice-chat/openai-whisper", model: "whisper-1", language: "en" },
+  stt: { provider: "voice-chat/parakeet-local", model: "mlx-community/parakeet-tdt-0.6b-v3" },
   tts: { provider: "voice-chat/openai", model: "tts-1", voice: "shimmer", format: "mp3" as AudioFormat },
   interrupt: true,
   mode: "ptt" as CaptureMode,
