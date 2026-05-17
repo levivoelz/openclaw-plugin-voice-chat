@@ -56,7 +56,6 @@ export class Vad {
   private chunks: Buffer[] = [];
   private preRoll: Buffer[] = [];
   private peakRms = 0;         // max RMS observed during current SPEECH
-  private muted = false;
 
   constructor(onUtterance: (pcm: Buffer) => void, options: VadOptions) {
     this.opts = { ...DEFAULTS, ...options };
@@ -64,18 +63,7 @@ export class Vad {
     this.onUtterance = onUtterance;
   }
 
-  /**
-   * Half-duplex gate. When muted, incoming audio is dropped and any in-flight
-   * state is reset without emitting. Used to suppress mic ingest during local
-   * TTS playback so the speaker→mic echo loop doesn't trigger a phantom turn.
-   */
-  setMuted(muted: boolean): void {
-    if (muted && !this.muted) this.reset();
-    this.muted = muted;
-  }
-
   push(pcm: Buffer): void {
-    if (this.muted) return;
     const rms = computeRms(pcm);
     const isSpeech = rms >= this.opts.threshold;
     const bytes = pcm.byteLength;

@@ -22,6 +22,7 @@
     "dist",
     "src",
     "types",
+    "daemon",
     "openclaw.plugin.json",
     "README.md",
     "LICENSE"

@@ -1,23 +1,35 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { createConnection, type Socket } from "node:net";
+import { fileURLToPath } from "node:url";
 import type { ProviderRegistry } from "../registry.js";
 import type { SttCreateOptions, SttSession } from "./types.js";
 
 /**
  * Local Parakeet TDT STT via `parakeet-mlx` (Apple-Silicon-native, MLX
- * framework). Buffered PCM goes to a tmp WAV; we shell out to the CLI;
- * parse the JSON output. No network call, no API key — and no whisper
- * training-data hallucinations.
+ * framework). Buffered PCM goes through a long-lived Unix-socket daemon that
+ * holds the model in memory across utterances. On socket failure the provider
+ * automatically falls back to the original CLI-spawn path so the plugin still
+ * works in environments without the daemon.
  *
  * Config (under `channels.voice-chat.parakeet`):
  *   - binary: path to parakeet-mlx (default: looked up on PATH)
  *   - model:  HuggingFace model id (default: mlx-community/parakeet-tdt-0.6b-v3)
- *   - language: ignored (parakeet-tdt is English-only at this size; multilingual
- *     models exist but we default to the v3-en variant)
+ *   - daemonSocket: Unix socket path (default: /tmp/openclaw-parakeet.sock)
+ *   - daemonBin:    Python script to launch as daemon (default: auto-detected)
+ *   - language: ignored (parakeet-tdt is English-only at this size)
  */
+
+const SOCKET_PATH = "/tmp/openclaw-parakeet.sock";
+// Resolve the daemon script path relative to this module's location.
+const _dir = dirname(fileURLToPath(import.meta.url));
+// From dist/providers/stt/ → project root → daemon/
+const DAEMON_SCRIPT = join(_dir, "../../../daemon/parakeet-daemon.py");
+
+// ─── WAV wrapping ────────────────────────────────────────────────────────────
 
 function wrapPcm16AsWav(pcm: Buffer, sampleRate: number): Buffer {
   const header = Buffer.alloc(44);
@@ -38,9 +50,13 @@ function wrapPcm16AsWav(pcm: Buffer, sampleRate: number): Buffer {
   return Buffer.concat([header, pcm]);
 }
 
+// ─── Config ──────────────────────────────────────────────────────────────────
+
 type ParakeetConfig = {
   binary?: string;
   model?: string;
+  daemonSocket?: string;
+  daemonBin?: string;
 };
 
 function readParakeetConfig(cfg: Record<string, unknown>): Required<ParakeetConfig> {
@@ -48,10 +64,150 @@ function readParakeetConfig(cfg: Record<string, unknown>): Required<ParakeetConf
   return {
     binary: p.binary ?? "parakeet-mlx",
     model: p.model ?? "mlx-community/parakeet-tdt-0.6b-v3",
+    daemonSocket: p.daemonSocket ?? SOCKET_PATH,
+    daemonBin: p.daemonBin ?? DAEMON_SCRIPT,
   };
 }
 
-function transcribe(pcm: Buffer, sampleRate: number, cfg: Required<ParakeetConfig>, timeoutMs: number): Promise<string> {
+// ─── Daemon lifecycle ─────────────────────────────────────────────────────────
+
+let daemonSpawnAttempted = false;
+
+/**
+ * Spawn the daemon detached so it outlives the Node process. If the daemon
+ * binary doesn't exist, skip silently — the CLI fallback will handle it.
+ */
+function spawnDaemon(cfg: Required<ParakeetConfig>): void {
+  if (daemonSpawnAttempted) return;
+  daemonSpawnAttempted = true;
+
+  const script = cfg.daemonBin;
+  if (!existsSync(script)) {
+    // Daemon script not installed — that's fine, CLI path will be used.
+    return;
+  }
+
+  // Use the python3 that ships with the uv-installed parakeet-mlx env if
+  // possible, otherwise fall back to system python3.
+  const python = resolvePython();
+  const child = spawn(
+    python,
+    [script, "--model", cfg.model, "--socket", cfg.daemonSocket],
+    {
+      detached: true,
+      stdio: "ignore",
+    },
+  );
+  child.unref();
+}
+
+function resolvePython(): string {
+  // If the uv tool's python is available, prefer it (it has parakeet_mlx).
+  // Otherwise use system python3 and rely on the daemon's own PATH search.
+  const candidates = [
+    "/Users/iris/.local/share/uv/tools/parakeet-mlx/bin/python3",
+    "/Users/iris/.local/share/uv/tools/parakeet-mlx/bin/python",
+    "python3",
+  ];
+  for (const c of candidates) {
+    if (c === "python3") return c; // system fallback
+    if (existsSync(c)) return c;
+  }
+  return "python3";
+}
+
+// ─── Socket transport ─────────────────────────────────────────────────────────
+
+/**
+ * Send PCM audio to the daemon over a Unix socket. Returns the transcribed
+ * text, or throws if the daemon is unreachable or returns an error.
+ *
+ * Timeout: 10 s connect + 60 s inference.
+ */
+function transcribeViaDaemon(
+  pcm: Buffer,
+  sampleRate: number,
+  socketPath: string,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const payload = JSON.stringify({
+      audio_pcm_b64: pcm.toString("base64"),
+      sample_rate: sampleRate,
+    }) + "\n";
+
+    let sock: Socket | null = null;
+    let settled = false;
+    let recvBuf = "";
+
+    const connectTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        sock?.destroy();
+        reject(new Error("parakeet-daemon: connect timeout"));
+      }
+    }, 10_000);
+
+    const inferTimer = { ref: null as ReturnType<typeof setTimeout> | null };
+
+    function done(err: Error | null, text?: string) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      if (inferTimer.ref) clearTimeout(inferTimer.ref);
+      sock?.destroy();
+      if (err) reject(err);
+      else resolve(text!);
+    }
+
+    try {
+      sock = createConnection({ path: socketPath });
+    } catch (err) {
+      clearTimeout(connectTimer);
+      reject(err);
+      return;
+    }
+
+    sock.on("connect", () => {
+      clearTimeout(connectTimer);
+      // Start inference timeout once connected.
+      inferTimer.ref = setTimeout(() => {
+        done(new Error("parakeet-daemon: inference timeout"));
+      }, 60_000);
+      sock!.write(payload);
+    });
+
+    sock.on("data", (chunk: Buffer) => {
+      recvBuf += chunk.toString("utf8");
+      const nl = recvBuf.indexOf("\n");
+      if (nl === -1) return;
+      const line = recvBuf.slice(0, nl).trim();
+      try {
+        const resp = JSON.parse(line) as { text?: string; error?: string };
+        if (resp.error) {
+          done(new Error(`parakeet-daemon: ${resp.error}`));
+        } else {
+          done(null, (resp.text ?? "").trim());
+        }
+      } catch (e) {
+        done(new Error(`parakeet-daemon: bad response JSON: ${line}`));
+      }
+    });
+
+    sock.on("error", (err) => done(err));
+    sock.on("close", () => {
+      if (!settled) done(new Error("parakeet-daemon: connection closed before response"));
+    });
+  });
+}
+
+// ─── CLI fallback (original implementation) ───────────────────────────────────
+
+function transcribeViaCli(
+  pcm: Buffer,
+  sampleRate: number,
+  cfg: Required<ParakeetConfig>,
+  timeoutMs: number,
+): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "parakeet-"));
   const wavPath = join(dir, `${randomUUID()}.wav`);
   writeFileSync(wavPath, wrapPcm16AsWav(pcm, sampleRate));
@@ -80,7 +236,6 @@ function transcribe(pcm: Buffer, sampleRate: number, cfg: Required<ParakeetConfi
           reject(new Error(`parakeet-mlx exited ${code}: ${stderr.slice(0, 400)}`));
           return;
         }
-        // Output file: <basename>.json — find any .json in dir.
         const jsonFile = readdirSync(dir).find((f) => f.endsWith(".json"));
         if (!jsonFile) { reject(new Error("parakeet-mlx produced no JSON output")); return; }
         const parsed = JSON.parse(readFileSync(join(dir, jsonFile), "utf8")) as { text?: string };
@@ -92,18 +247,48 @@ function transcribe(pcm: Buffer, sampleRate: number, cfg: Required<ParakeetConfi
   });
 }
 
+// ─── Main transcribe (daemon → CLI fallback) ──────────────────────────────────
+
+/**
+ * Try the daemon socket first. If that fails (not running, connect error,
+ * or timeout), fall through to the CLI spawn so the plugin always works.
+ */
+async function transcribe(
+  pcm: Buffer,
+  sampleRate: number,
+  cfg: Required<ParakeetConfig>,
+  timeoutMs: number,
+): Promise<string> {
+  try {
+    return await transcribeViaDaemon(pcm, sampleRate, cfg.daemonSocket);
+  } catch {
+    // Daemon unavailable — fall back to CLI.
+    return transcribeViaCli(pcm, sampleRate, cfg, timeoutMs);
+  }
+}
+
+// ─── Session ──────────────────────────────────────────────────────────────────
+
 function createSession(opts: SttCreateOptions): SttSession {
   const { sampleRate, providerConfig, callbacks } = opts;
   const cfg = readParakeetConfig(providerConfig);
 
   let buf: Buffer[] = [];
   let connected = true;
+  let daemonEnsured = false;
+
+  function ensureDaemon() {
+    if (daemonEnsured) return;
+    daemonEnsured = true;
+    spawnDaemon(cfg);
+  }
 
   return {
     async connect() { /* no-op */ },
     sendAudio(pcm: Buffer) { if (connected) buf.push(pcm); },
     async endUtterance() {
       if (!connected || buf.length === 0) return;
+      ensureDaemon();
       const pcm = Buffer.concat(buf);
       buf = [];
       try {
@@ -125,7 +310,6 @@ export function registerParakeetLocalStt(registry: ProviderRegistry): void {
     streaming: false,
     models: ["mlx-community/parakeet-tdt-0.6b-v3"],
     defaultModel: "mlx-community/parakeet-tdt-0.6b-v3",
-    // Always "configured" — the binary check happens at first use.
     isConfigured: () => true,
     create: createSession,
   });

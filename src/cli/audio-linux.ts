@@ -42,8 +42,7 @@ export function startVadRecording(opts: {
   sampleRate: number;
   onUtterance: (pcm: Buffer) => void;
   onError: (e: Error) => void;
-}): { stop: () => void; setMuted: (muted: boolean) => void } {
-  let muted = false;
+}): { stop: () => void } {
   const proc = spawn("sox", [
     "-d",
     "-t", "raw",
@@ -55,9 +54,7 @@ export function startVadRecording(opts: {
     "silence", "1", "0.2", "3%", "1", "1.5", "3%", ":", "restart",
   ]);
 
-  proc.stdout.on("data", (chunk: Buffer) => {
-    if (!muted) opts.onUtterance(chunk);
-  });
+  proc.stdout.on("data", (chunk: Buffer) => opts.onUtterance(chunk));
   proc.stderr.on("data", () => {});
   proc.on("error", opts.onError);
   proc.on("close", (code) => {
@@ -66,10 +63,7 @@ export function startVadRecording(opts: {
     }
   });
 
-  return {
-    stop: () => killQuietly(proc),
-    setMuted: (m: boolean) => { muted = m; },
-  };
+  return { stop: () => killQuietly(proc) };
 }
 
 export async function playAudio(args: {
