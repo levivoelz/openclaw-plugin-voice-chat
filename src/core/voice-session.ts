@@ -212,8 +212,12 @@ export class VoiceSession {
     const runtime = getVoiceChatRuntime() as RuntimeShape;
     const cfg = this.d.cfg;
 
-    const route = runtime.channel.routing.resolveAgentRoute({
-      cfg,
+    // Build the session key explicitly from (agent, channel, accountId, peer)
+    // — bypasses resolveAgentRoute which can collapse to the agent's `:main`
+    // session and end up sharing thread state with the agent's autonomous
+    // work. We want voice in its own thread, keyed to the connecting client.
+    const sessionKey = runtime.channel.routing.buildAgentSessionKey({
+      agentId: this.d.agentId,
       channel: CHANNEL_ID,
       accountId: this.d.accountId,
       peer: { kind: "direct", id: this.d.clientId },
@@ -226,7 +230,7 @@ export class VoiceSession {
       CommandBody: transcript,
       From: this.d.clientId,
       To: this.d.clientId,
-      SessionKey: route.sessionKey,
+      SessionKey: sessionKey,
       AccountId: this.d.accountId,
       ChatType: "direct",
       Provider: CHANNEL_ID,
@@ -236,7 +240,7 @@ export class VoiceSession {
 
     const { onModelSelected, ...replyPipeline } = createChannelReplyPipeline({
       cfg,
-      agentId: route.agentId,
+      agentId: this.d.agentId,
       channel: CHANNEL_ID,
       accountId: this.d.accountId,
     });
@@ -244,10 +248,10 @@ export class VoiceSession {
     await runtime.channel.turn.runPrepared({
       channel: CHANNEL_ID,
       accountId: this.d.accountId,
-      routeSessionKey: route.sessionKey,
+      routeSessionKey: sessionKey,
       storePath: runtime.channel.session.resolveStorePath(
         (cfg as { session?: { store?: unknown } } | undefined)?.session?.store,
-        { agentId: route.agentId },
+        { agentId: this.d.agentId },
       ),
       ctxPayload,
       recordInboundSession: runtime.channel.session.recordInboundSession,
@@ -351,12 +355,12 @@ export class VoiceSession {
 type RuntimeShape = {
   channel: {
     routing: {
-      resolveAgentRoute: (args: {
-        cfg: unknown;
+      buildAgentSessionKey: (args: {
+        agentId: string;
         channel: string;
         accountId: string;
         peer: { kind: string; id: string };
-      }) => { agentId: string; sessionKey: string; accountId?: string };
+      }) => string;
     };
     reply: {
       finalizeInboundContext: (payload: Record<string, unknown>) => Record<string, unknown>;
