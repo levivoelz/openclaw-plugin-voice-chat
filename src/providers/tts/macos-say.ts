@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import { readFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ProviderRegistry } from "../registry.js";
 import type { TtsProviderDescriptor, TtsSynthesizeRequest, TtsStreamChunk, TtsVoice } from "./types.js";
 
@@ -61,15 +65,16 @@ const descriptor: TtsProviderDescriptor = {
   async *synthesize(req: TtsSynthesizeRequest): AsyncIterable<TtsStreamChunk> {
     const voice = req.voice ?? "Samantha";
 
-    // LEI16@22050 = little-endian signed 16-bit PCM at 22050 Hz (AIFF-like raw).
-    // Writing to "-" sends AIFF to stdout; we wrap it in a WAV container upstream.
+    // macOS `say` won't write audio to stdout — it only writes to a file path.
+    // Use a tmp file, then read it back as chunks. Non-streaming is fine here:
+    // the descriptor advertises `streaming: false`.
+    const tmpPath = join(tmpdir(), `voice-chat-say-${randomUUID()}.wav`);
     const child = spawn(
       "say",
-      ["-v", voice, "-o", "-", "--data-format=LEI16@22050"],
-      { stdio: ["pipe", "pipe", "inherit"] },
+      ["-v", voice, "-o", tmpPath, "--file-format=WAVE", "--data-format=LEI16@22050"],
+      { stdio: ["pipe", "ignore", "inherit"] },
     );
 
-    // Propagate abort to the child process.
     const onAbort = () => child.kill();
     if (req.signal) {
       if (req.signal.aborted) {
@@ -79,30 +84,27 @@ const descriptor: TtsProviderDescriptor = {
       }
     }
 
-    // Write the text to stdin then close it so `say` knows to start.
     child.stdin.end(req.text, "utf8");
 
-    let seq = 0;
-    const chunks: TtsStreamChunk[] = [];
-
-    await new Promise<void>((resolve, reject) => {
-      child.stdout.on("data", (d: Buffer) => {
-        chunks.push({ seq: ++seq, chunk: new Uint8Array(d.buffer, d.byteOffset, d.byteLength) });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.on("close", (code) => {
+          if (code !== 0 && !req.signal?.aborted) {
+            reject(new Error(`say exited with code ${code}`));
+          } else {
+            resolve();
+          }
+        });
+        child.on("error", (err) => reject(err));
       });
-      child.on("close", (code) => {
-        if (code !== 0 && !req.signal?.aborted) {
-          reject(new Error(`say exited with code ${code}`));
-        } else {
-          resolve();
-        }
-      });
-      child.on("error", (err) => reject(err));
-    });
 
-    req.signal?.removeEventListener("abort", onAbort);
+      if (req.signal?.aborted) return;
 
-    for (const c of chunks) {
-      yield c;
+      const buf = await readFile(tmpPath);
+      yield { seq: 1, chunk: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) };
+    } finally {
+      req.signal?.removeEventListener("abort", onAbort);
+      await unlink(tmpPath).catch(() => { /* ignore */ });
     }
   },
 };
