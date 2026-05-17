@@ -87,7 +87,7 @@
             "properties": {
               "provider": { "type": "string", "default": "voice-chat/openai" },
               "model":    { "type": "string", "default": "tts-1" },
-              "voice":    { "type": "string", "default": "alloy" },
+              "voice":    { "type": "string", "default": "shimmer" },
               "format":   { "type": "string", "enum": ["mp3", "pcm16", "opus"], "default": "mp3" }
             }
           },

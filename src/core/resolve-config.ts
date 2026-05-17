@@ -18,7 +18,7 @@ export type PluginConfigShape = {
 
 const DEFAULTS = {
   stt: { provider: "voice-chat/openai-whisper", model: "whisper-1" },
-  tts: { provider: "voice-chat/openai", model: "tts-1", voice: "alloy", format: "mp3" as AudioFormat },
+  tts: { provider: "voice-chat/openai", model: "tts-1", voice: "shimmer", format: "mp3" as AudioFormat },
   interrupt: true,
   mode: "ptt" as CaptureMode,
 };
