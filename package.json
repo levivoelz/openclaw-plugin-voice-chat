@@ -23,7 +23,6 @@
     "src",
     "types",
     "openclaw.plugin.json",
-    "ui",
     "README.md",
     "LICENSE"
   ],

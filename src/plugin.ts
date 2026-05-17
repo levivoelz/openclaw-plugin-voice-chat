@@ -149,10 +149,11 @@ export default defineChannelPluginEntry({
 
     apiAny.registerHttpRoute({
       path: VOICE_WS_PATH,
-      // TEMPORARILY plugin-auth (open) for end-to-end channel verification.
-      // Revert to "gateway" once we've added a device-token handshake on the
-      // client side (CLI + UI panel).
-      auth: "plugin",
+      // Must be "gateway" for WS upgrades — the gateway's plugin upgrade
+      // dispatcher only routes routes whose `auth` is "gateway"; "plugin"
+      // works for plain HTTP but WS upgrades are skipped. Clients must
+      // complete the gateway's challenge handshake first (device token).
+      auth: "gateway",
       handler: (_req, res) => {
         res.writeHead(426, "Upgrade Required").end();
       },
@@ -167,40 +168,6 @@ export default defineChannelPluginEntry({
         });
       },
     });
-
-    tryRegisterSessionAction(
-      apiAny,
-      {
-        id: "voice-chat.start",
-        label: "Talk",
-        icon: "microphone",
-        invoke: ({ sessionKey, agentId }: { sessionKey: string; agentId: string }) => ({
-          openPanel: "voice-chat",
-          params: { sessionKey, agentId },
-        }),
-      },
-      logger,
-    );
-    tryRegisterControlUi(
-      apiAny,
-      {
-        id: "voice-chat.panel",
-        title: "Voice Chat",
-        entry: "./ui/panel/index.html",
-        mountPoints: ["session.sidebar", "session.modal"],
-      },
-      logger,
-    );
-    tryRegisterControlUi(
-      apiAny,
-      {
-        id: "voice-chat.settings",
-        title: "Voice Chat",
-        entry: "./ui/settings/index.html",
-        mountPoints: ["settings.plugin"],
-      },
-      logger,
-    );
 
     logger.info(
       `voice-chat: ready (${registry.listStt().length} STT, ${registry.listTts().length} TTS providers)`,
@@ -343,52 +310,3 @@ function cryptoRandomId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-function tryRegisterSessionAction(
-  api: Record<string, unknown>,
-  action: unknown,
-  logger: Logger,
-): void {
-  const fn = pickFn(api, [
-    ["session", "actions", "register"],
-    ["sessions", "actions", "register"],
-    ["session", "registerAction"],
-  ]);
-  if (!fn) {
-    logger.debug("voice-chat: session action API not present (Talk button skipped)");
-    return;
-  }
-  try { fn.call(api, action); } catch (e) { logger.warn(`voice-chat: session action registration failed: ${(e as Error).message}`); }
-}
-
-function tryRegisterControlUi(
-  api: Record<string, unknown>,
-  descriptor: unknown,
-  logger: Logger,
-): void {
-  const fn = pickFn(api, [
-    ["controlUi", "registerDescriptor"],
-    ["session", "controls", "registerControlUiDescriptor"],
-    ["ui", "registerDescriptor"],
-  ]);
-  if (!fn) {
-    logger.debug("voice-chat: Control UI descriptor API not present (panel will not auto-mount)");
-    return;
-  }
-  try { fn.call(api, descriptor); } catch (e) { logger.warn(`voice-chat: control UI registration failed: ${(e as Error).message}`); }
-}
-
-// eslint-disable-next-line @typescript-eslint/ban-types
-function pickFn(root: unknown, paths: string[][]): Function | null {
-  for (const path of paths) {
-    let cur: unknown = root;
-    let ok = true;
-    for (const k of path) {
-      if (cur && typeof cur === "object" && k in (cur as Record<string, unknown>)) {
-        cur = (cur as Record<string, unknown>)[k];
-      } else { ok = false; break; }
-    }
-    // eslint-disable-next-line @typescript-eslint/ban-types
-    if (ok && typeof cur === "function") return cur as Function;
-  }
-  return null;
-}
