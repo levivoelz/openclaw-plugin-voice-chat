@@ -1,80 +1,46 @@
 /**
- * Iris-secrets daemon client. All STT/TTS providers route through the daemon
- * so the plugin never holds raw API keys. The daemon (running on the levi
- * account) keeps the keys; iris just holds a bearer token to talk to it.
+ * Iris-secrets daemon client. Providers route credentialed calls through the
+ * daemon so the plugin never holds raw third-party API keys.
  *
- * Config shape (under `channels.voice-chat.daemon`):
- *   { url?: string, token?: string, tokenFile?: string }
- *
- * Defaults: url = http://127.0.0.1:9876, tokenFile = /Users/iris/.iris-secrets-daemon/auth.json.
- * Token is resolved from `token` (literal) or `tokenFile` (`{bearer_token}` JSON
- * field), in that order.
+ * Auth: the daemon's bearer token lives in the user's macOS Keychain at
+ * (account = $USER, service = "iris-secrets-daemon-token"). This matches the
+ * pattern iris's own iris-secrets-client.py and webhook-server/server.js use.
+ * One source of truth, no fallbacks, no env vars, no config secrets.
  */
 
-import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-
-export type DaemonConfig = {
-  url?: string;
-  token?: string;
-  tokenFile?: string;
-};
-
-const DEFAULT_URL = "http://127.0.0.1:9876";
 
 export type DaemonAuth = { url: string; token: string };
 
+const DAEMON_URL = "http://127.0.0.1:9876";
+const KEYCHAIN_SERVICE = "iris-secrets-daemon-token";
+
 let cachedToken: string | null = null;
 
-export function isDaemonConfigured(cfg: Record<string, unknown>): boolean {
-  try { resolveDaemonAuth(cfg); return true; } catch { return false; }
+export function isDaemonConfigured(_cfg: Record<string, unknown>): boolean {
+  try { resolveDaemonAuth(_cfg); return true; } catch { return false; }
 }
 
-/**
- * Resolution order — matches the iris-secrets-client.py pattern, plus a
- * file-based fallback for non-iris callers (e.g. the levi-side CLI smoke test).
- *
- *   1. explicit `daemon.token` in plugin config
- *   2. $IRIS_DAEMON_TOKEN env var
- *   3. `daemon.tokenFile` JSON (if configured) — reads `bearer_token` field
- *   4. macOS Keychain: `iris-secrets-daemon-token` for the current user
- *   5. /Users/levi/.iris-secrets-daemon/auth.json (canonical levi-side file)
- */
-export function resolveDaemonAuth(cfg: Record<string, unknown>): DaemonAuth {
-  const d = (cfg["daemon"] ?? {}) as DaemonConfig;
-  const url = d.url ?? DEFAULT_URL;
-  const token =
-    d.token ??
-    process.env["IRIS_DAEMON_TOKEN"] ??
-    (d.tokenFile ? readTokenFile(d.tokenFile) : null) ??
-    cachedToken ??
-    readKeychainToken() ??
-    readTokenFile("/Users/levi/.iris-secrets-daemon/auth.json");
-  if (!token) {
+export function resolveDaemonAuth(_cfg: Record<string, unknown>): DaemonAuth {
+  if (!cachedToken) cachedToken = readKeychainToken();
+  if (!cachedToken) {
     throw new Error(
-      "voice-chat: iris-secrets daemon token not resolvable (tried config.token, " +
-      "$IRIS_DAEMON_TOKEN, configured tokenFile, macOS Keychain, levi-side auth.json)",
+      `voice-chat: keychain item "${KEYCHAIN_SERVICE}" not found for user ` +
+      `"${process.env["USER"] ?? "?"}". Add it with: ` +
+      `security add-generic-password -a "$USER" -s ${KEYCHAIN_SERVICE} -w "<token>"`,
     );
   }
-  cachedToken = token;
-  return { url, token };
-}
-
-function readTokenFile(path: string): string | null {
-  try {
-    const raw = readFileSync(path, "utf8");
-    const j = JSON.parse(raw) as Record<string, unknown>;
-    const t = j["bearer_token"] ?? j["token"];
-    return typeof t === "string" && t.length > 0 ? t : null;
-  } catch { return null; }
+  return { url: DAEMON_URL, token: cachedToken };
 }
 
 function readKeychainToken(): string | null {
   if (process.platform !== "darwin") return null;
+  const user = process.env["USER"];
+  if (!user) return null;
   try {
     const out = execFileSync(
       "security",
-      ["find-generic-password", "-a", process.env["USER"] ?? "iris", "-s", "iris-secrets-daemon-token", "-w"],
+      ["find-generic-password", "-a", user, "-s", KEYCHAIN_SERVICE, "-w"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 },
     ).trim();
     return out.length > 0 ? out : null;
