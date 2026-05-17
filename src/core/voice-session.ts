@@ -43,6 +43,7 @@ type TurnTiming = {
   firstDelta: number | null;
   ttsStart: number | null;
   firstTtsByte: number | null;
+  firstTtsDone: number | null;
 };
 
 function nowMs(): number {
@@ -92,6 +93,8 @@ export class VoiceSession {
   // Pending audio timestamps captured from speech.start/end before turnId is known.
   private _pendingAudioStart: number | null = null;
   private _pendingAudioEnd: number | null = null;
+  // Pending audio byte count — accumulated in handleBinary between speech.start and speech.end.
+  private _pendingAudioBytes = 0;
 
   constructor(deps: VoiceSessionDeps) {
     this.ws = deps.ws;
@@ -172,6 +175,7 @@ export class VoiceSession {
           // The real per-turn timing is keyed by turnId in onFinalTranscript.
           // Store audioStart in a pending slot; it gets promoted when the turn fires.
           this._pendingAudioStart = nowMs();
+          this._pendingAudioBytes = 0;
           this.d.logger.info(`voice-chat: speech.start t=${this._pendingAudioStart}`);
         }
         break;
@@ -180,11 +184,13 @@ export class VoiceSession {
         void this.stt?.endUtterance();
         if (DEBUG) {
           this._pendingAudioEnd = nowMs();
-          const audioMs = this._pendingAudioStart !== null
-            ? this._pendingAudioEnd - this._pendingAudioStart
+          // Compute audio duration from actual bytes received (24 kHz mono PCM16:
+          // sample_rate=24000, bytes_per_sample=2 → bytes / 48000 * 1000 ms).
+          const audioMs = this._pendingAudioBytes > 0
+            ? Math.round(this._pendingAudioBytes / (SAMPLE_RATE * 2) * 1000)
             : null;
           this.d.logger.info(
-            `voice-chat: speech.end audio_ms=${audioMs ?? "?"}`,
+            `voice-chat: speech.end audio_ms=${audioMs ?? "?"} bytes=${this._pendingAudioBytes}`,
           );
         }
         break;
@@ -208,6 +214,7 @@ export class VoiceSession {
   }
 
   handleBinary(audio: Buffer): void {
+    if (DEBUG) this._pendingAudioBytes += audio.byteLength;
     this.stt?.sendAudio(audio);
   }
 
@@ -256,6 +263,7 @@ export class VoiceSession {
         firstDelta: null,
         ttsStart: null,
         firstTtsByte: null,
+        firstTtsDone: null,
       };
       this.turnTimings.set(turnId, timing);
       const sttMs = this._pendingAudioEnd !== null ? tNow - this._pendingAudioEnd : null;
@@ -299,7 +307,7 @@ export class VoiceSession {
         if (timing) {
           const e2eMs = nowMs() - timing.audioStart;
           this.d.logger.info(
-            `voice-chat: turn.complete turn=${shortId} e2e_ms=${e2eMs}`,
+            `voice-chat: turn.text_done turn=${shortId} e2e_ms=${e2eMs}`,
           );
           this.turnTimings.delete(turnId);
         }
@@ -366,6 +374,13 @@ export class VoiceSession {
       ChatType: "direct",
       Provider: CHANNEL_ID,
       Surface: CHANNEL_ID,
+      // "voice" is in TOOL_DENY_BY_MESSAGE_PROVIDER in the openclaw runtime, which
+      // causes filterToolsByMessageProvider to strip the built-in `tts` tool before
+      // the model sees it. Without this, the model calls tts itself and emits the
+      // [[audio_as_voice]] sentinel, suppressing the text reply the plugin needs.
+      // OriginatingChannel takes precedence over Provider in resolveOriginMessageProvider,
+      // so routing (Provider/Surface) is unaffected.
+      OriginatingChannel: "voice",
       CommandAuthorized: true,
     });
 
@@ -451,18 +466,18 @@ export class VoiceSession {
         signal,
       });
       let totalBytes = 0;
-      let firstByteLogged = false;
       for await (const { chunk } of stream) {
         if (signal.aborted || this.closed) return;
         const seq = (this.ttsSeqByTurn.get(turnId) ?? 0) + 1;
         this.ttsSeqByTurn.set(turnId, seq);
         totalBytes += chunk.byteLength;
 
-        if (DEBUG && !firstByteLogged) {
-          firstByteLogged = true;
-          const tNow = nowMs();
+        if (DEBUG) {
           const timing = this.turnTimings.get(turnId);
-          if (timing) {
+          // Gate on timing.firstTtsByte === null so this fires exactly once per
+          // turn across all chained speak() calls (not just once per call).
+          if (timing && timing.firstTtsByte === null) {
+            const tNow = nowMs();
             timing.firstTtsByte = tNow;
             const firstByteMs = timing.ttsStart !== null ? tNow - timing.ttsStart : null;
             this.d.logger.info(
@@ -477,6 +492,20 @@ export class VoiceSession {
       if (!signal.aborted && !this.closed) {
         this.send({ type: "tts.done", turnId });
         this.d.logger.info(`voice-chat: tts.done turn=${shortId} bytes=${totalBytes} duration=${Date.now() - t0}ms`);
+        if (DEBUG) {
+          const timing = this.turnTimings.get(turnId);
+          // Fire turn.audio_start exactly once per turn — on the first tts.done.
+          // This is the server's best proxy for "first audio played back" since
+          // the CLI plays immediately when it receives tts.done.
+          if (timing && timing.firstTtsDone === null) {
+            const tNow = nowMs();
+            timing.firstTtsDone = tNow;
+            const e2eMs = tNow - timing.audioStart;
+            this.d.logger.info(
+              `voice-chat: turn.audio_start turn=${shortId} e2e_ms=${e2eMs}`,
+            );
+          }
+        }
       }
     } catch (e) {
       if (signal.aborted) return;
