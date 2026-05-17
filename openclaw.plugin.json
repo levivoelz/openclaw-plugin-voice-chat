@@ -72,6 +72,10 @@
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "default": true },
+          "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 18790,
+                    "description": "TCP port the plugin's own WebSocket server listens on." },
+          "host": { "type": "string", "default": "127.0.0.1",
+                    "description": "Bind address. Use '0.0.0.0' for LAN-wide; '127.0.0.1' (default) is loopback-only." },
           "stt": {
             "type": "object",
             "additionalProperties": false,

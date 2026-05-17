@@ -19,7 +19,7 @@ const HELP = `
 openclaw-voice [options]
 
 Options:
-  --gateway <url>         WS gateway URL (default: ws://127.0.0.1:18789)
+  --gateway <url>         WS gateway URL (default: ws://127.0.0.1:18790)
                           or \$OPENCLAW_GATEWAY
   --agent <id>            Target agent id (default: gateway default)
   --session <key>         Resume an existing chat session by sessionKey
@@ -79,7 +79,7 @@ async function main(): Promise<void> {
   const gateway =
     arg(argv, "--gateway") ??
     process.env["OPENCLAW_GATEWAY"] ??
-    "ws://127.0.0.1:18789";
+    "ws://127.0.0.1:18790";
 
   const deviceToken =
     arg(argv, "--device-token") ??

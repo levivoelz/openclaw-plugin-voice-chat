@@ -36,7 +36,6 @@ import { registerMacosSayTts } from "./providers/tts/macos-say.js";
 import { resolveVoiceConfig, type PluginConfigShape } from "./core/resolve-config.js";
 import { VoiceSession } from "./core/voice-session.js";
 import {
-  VOICE_WS_PATH,
   type ClientFrame,
   type VoiceConnectParams,
   isClientFrame,
@@ -98,11 +97,22 @@ const voiceChatPlugin = createChatChannelPlugin({
     gateway: {
       startAccount: async (ctx: GatewayStartAccountCtx) => {
         const logger = ctxLogger(ctx);
-        const wss = new WebSocketServer({ noServer: true });
+
+        // Read port + bind from channel config (`channels.voice-chat.{port,host}`).
+        // Loopback default for personal/local use; bind to "0.0.0.0" to allow LAN.
+        const chCfg = readChannelConfig(ctx.cfg);
+        const port = chCfg.port ?? 18790;
+        const host = chCfg.host ?? "127.0.0.1";
+
+        const wss = new WebSocketServer({ port, host });
         activeWss = wss;
+        logger.info(`voice-chat: WS server listening on ws://${host}:${port}`);
 
         wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
           attachVoiceConnection({ ws, req, cfg: ctx.cfg, accountId: ctx.account.accountId, logger });
+        });
+        wss.on("error", (err) => {
+          logger.error(`voice-chat: WSS error: ${(err as Error).message}`);
         });
 
         ctx.setStatus({
@@ -130,6 +140,20 @@ const voiceChatPlugin = createChatChannelPlugin({
   },
 });
 
+function readChannelConfig(cfg: unknown): { port?: number; host?: string } {
+  if (!cfg || typeof cfg !== "object") return {};
+  const channels = (cfg as Record<string, unknown>)["channels"];
+  const ch = channels && typeof channels === "object"
+    ? (channels as Record<string, unknown>)[CHANNEL_ID]
+    : undefined;
+  if (!ch || typeof ch !== "object") return {};
+  const c = ch as Record<string, unknown>;
+  return {
+    port: typeof c["port"] === "number" ? (c["port"] as number) : undefined,
+    host: typeof c["host"] === "string" ? (c["host"] as string) : undefined,
+  };
+}
+
 export default defineChannelPluginEntry({
   id: CHANNEL_ID,
   name: "Voice Chat",
@@ -139,38 +163,14 @@ export default defineChannelPluginEntry({
   setRuntime: (runtime) => {
     setVoiceChatRuntime(runtime);
   },
-  // The full-runtime registration is where we hook the HTTP/WS route. The
-  // host calls this on register; we don't have access to the WSS yet (that's
-  // created lazily in startAccount), so the handler reads `activeWss` on each
-  // upgrade.
+  // Plugin owns its own WS server in startAccount; no gateway HTTP route to
+  // register. Browser clients (if we ever ship one) connect to the same port
+  // directly; CLI clients use ws://127.0.0.1:18790 by default.
   registerFull: (api) => {
     const apiAny = api as ApiWithDirectMethods;
     const logger = apiAny.logger ?? consoleLogger();
-
-    apiAny.registerHttpRoute({
-      path: VOICE_WS_PATH,
-      // Must be "gateway" for WS upgrades — the gateway's plugin upgrade
-      // dispatcher only routes routes whose `auth` is "gateway"; "plugin"
-      // works for plain HTTP but WS upgrades are skipped. Clients must
-      // complete the gateway's challenge handshake first (device token).
-      auth: "gateway",
-      handler: (_req, res) => {
-        res.writeHead(426, "Upgrade Required").end();
-      },
-      handleUpgrade: (req, socket, head) => {
-        const wss = activeWss;
-        if (!wss || !req.url?.startsWith(VOICE_WS_PATH)) {
-          socket.destroy();
-          return;
-        }
-        wss.handleUpgrade(req, socket, head, (ws) => {
-          wss.emit("connection", ws, req);
-        });
-      },
-    });
-
     logger.info(
-      `voice-chat: ready (${registry.listStt().length} STT, ${registry.listTts().length} TTS providers)`,
+      `voice-chat: registered (${registry.listStt().length} STT, ${registry.listTts().length} TTS providers)`,
     );
   },
 });
@@ -188,12 +188,6 @@ type GatewayStartAccountCtx = {
 
 type ApiWithDirectMethods = {
   logger?: Logger;
-  registerHttpRoute(params: {
-    path: string;
-    auth: "gateway" | "plugin";
-    handler: (req: IncomingMessage, res: import("node:http").ServerResponse) => unknown;
-    handleUpgrade?: (req: IncomingMessage, socket: import("node:net").Socket, head: Buffer) => void;
-  }): void;
   [key: string]: unknown;
 };
 

@@ -5,7 +5,7 @@
 import readline from "node:readline";
 import { WebSocket } from "ws";
 import type { AudioFormat, CaptureMode, ServerFrame } from "../types.js";
-import { VOICE_WS_PATH, VOICE_PROTOCOL_VERSION } from "../types.js";
+import { VOICE_PROTOCOL_VERSION } from "../types.js";
 import { connect, sendFrame, attachRouter } from "./ws.js";
 import { resolveClientId } from "./client-id.js";
 
@@ -304,10 +304,10 @@ async function loadAudioMod(): Promise<AudioMod> {
 }
 
 function buildWsUrl(opts: TalkOptions): string {
-  const base = opts.gateway.replace(/\/$/, "");
-  const params = new URLSearchParams();
-  if (opts.session) params.set("session", opts.session);
-  if (opts.agentId) params.set("agent", opts.agentId);
-  const qs = params.toString();
-  return `${base}${VOICE_WS_PATH}${qs ? `?${qs}` : ""}`;
+  // Plugin owns its own WS port — connect to the root of the gateway URL
+  // (no path prefix). The plugin's WebSocketServer accepts any path.
+  const u = new URL(opts.gateway);
+  if (opts.session) u.searchParams.set("session", opts.session);
+  if (opts.agentId) u.searchParams.set("agent", opts.agentId);
+  return u.toString();
 }

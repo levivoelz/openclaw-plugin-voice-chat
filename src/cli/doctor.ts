@@ -8,7 +8,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { unlinkSync, existsSync } from "node:fs";
-import { VOICE_WS_PATH } from "../types.js";
 import { wsToHttp } from "./ws.js";
 
 const execFileAsync = promisify(execFile);
@@ -113,7 +112,7 @@ async function checkGatewayWs(gateway: string, token: string | undefined, _debug
 
     // Dynamically import ws to avoid requiring it at top level.
     import("ws").then(({ default: WebSocket }) => {
-      const wsUrl = `${gateway.replace(/\/$/, "")}${VOICE_WS_PATH}`;
+      const wsUrl = gateway.replace(/\/$/, "");
       const ws = new WebSocket(wsUrl, { headers });
       const timer = setTimeout(() => {
         ws.terminate();
@@ -150,7 +149,7 @@ async function checkGatewayWs(gateway: string, token: string | undefined, _debug
 async function checkPlugin(gateway: string, token: string | undefined, _debug: boolean): Promise<CheckResult> {
   // Try HTTP HEAD on the WS path; a 404 means the plugin route isn't registered.
   const httpBase = wsToHttp(gateway.replace(/\/$/, ""));
-  const url = `${httpBase}${VOICE_WS_PATH}`;
+  const url = httpBase;
 
   try {
     const res = await fetchWithTimeout(url, token, 4000, "HEAD");
