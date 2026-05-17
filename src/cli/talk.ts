@@ -3,11 +3,11 @@
  */
 
 import readline from "node:readline";
-import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import type { AudioFormat, CaptureMode, ServerFrame } from "../types.js";
 import { VOICE_WS_PATH, VOICE_PROTOCOL_VERSION } from "../types.js";
 import { connect, sendFrame, attachRouter } from "./ws.js";
+import { resolveClientId } from "./client-id.js";
 
 const ANSI_DIM    = "\x1b[2m";
 const ANSI_RESET  = "\x1b[0m";
@@ -20,6 +20,10 @@ export type TalkOptions = {
   gateway:     string;
   agentId?:    string;
   session?:    string;
+  /** Force a fresh, non-persisted clientId (one-off session). */
+  newSession?: boolean;
+  /** Use a specific clientId (peer.id for routing). Overrides default + --new. */
+  clientId?:   string;
   mode:        CaptureMode;
   stt?:        string;
   sttModel?:   string;
@@ -170,14 +174,24 @@ export async function talk(opts: TalkOptions): Promise<void> {
     },
   });
 
+  // Resolve a stable clientId for routing — same client = same chat session.
+  const clientId = resolveClientId({
+    agentId: opts.agentId ?? "default",
+    explicit: opts.clientId,
+    fresh: opts.newSession,
+  });
+  if (opts.debug || opts.print) {
+    process.stderr.write(`${ANSI_DIM}[session] clientId=${clientId}${ANSI_RESET}\n`);
+  }
+
   // Send hello.
   sendFrame(ws, {
     type: "hello",
-    clientId: randomUUID(),
+    clientId,
     protocol: VOICE_PROTOCOL_VERSION,
     mode: opts.mode,
     codec: "pcm16",
-    sampleRate: 16000,
+    sampleRate: 24000,
     sttHints: {
       provider: opts.stt,
       model: opts.sttModel,

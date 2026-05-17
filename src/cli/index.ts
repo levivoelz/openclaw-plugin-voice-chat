@@ -22,7 +22,10 @@ Options:
   --gateway <url>         WS gateway URL (default: ws://127.0.0.1:18789)
                           or \$OPENCLAW_GATEWAY
   --agent <id>            Target agent id (default: gateway default)
-  --session <key>         Resume an existing session
+  --session <key>         Resume an existing chat session by sessionKey
+  --client-id <id>        Use this exact peer id (bypasses --new and the
+                          per-agent persisted default)
+  --new                   Fresh, non-persisted clientId — one-off session
   --mode <ptt|vad>        Capture mode (default: ptt)
   --stt <provider>        STT provider id (e.g. voice-chat/openai-realtime)
   --stt-model <name>      STT model name
@@ -119,6 +122,8 @@ async function main(): Promise<void> {
     gateway,
     agentId:     arg(argv, "--agent"),
     session:     arg(argv, "--session"),
+    clientId:    arg(argv, "--client-id"),
+    newSession:  hasFlag(argv, "--new"),
     mode:        rawMode as CaptureMode,
     stt:         arg(argv, "--stt"),
     sttModel:    arg(argv, "--stt-model"),
