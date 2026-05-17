@@ -275,8 +275,15 @@ export class VoiceSession {
     this.ttsAbort = new AbortController();
     const ttsAbort = this.ttsAbort;
 
+    // Chain speak() calls so one chunk's TTS finishes (all binary frames
+    // pushed to the wire) before the next begins. Without this, multiple
+    // chunks emitted in quick succession run N parallel TTS streams that
+    // interleave MP3 bytes on the wire and produce garbled playback.
+    let speakChain: Promise<void> = Promise.resolve();
     this.sentenceBuf = new SentenceBuffer((chunk) => {
-      void this.speak(chunk, turnId, ttsProv, ttsAbort.signal);
+      speakChain = speakChain.then(() =>
+        this.speak(chunk, turnId, ttsProv, ttsAbort.signal),
+      ).catch(() => { /* swallow to keep chain alive */ });
     });
 
     const t0 = Date.now();

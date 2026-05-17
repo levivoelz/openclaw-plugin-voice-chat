@@ -12,11 +12,6 @@ import { resolveClientId } from "./client-id.js";
 const ANSI_DIM    = "\x1b[2m";
 const ANSI_RESET  = "\x1b[0m";
 
-// 8KB ≈ a few hundred ms of MP3 at 24kbps — playback starts on the first
-// chunk that crosses this size. Lower = snappier first-audio, higher = more
-// resistant to brief stalls. 50KB used to push first-audio out ~300–400ms.
-const QUICK_START_BYTES = 8 * 1024;
-
 type AudioMod = typeof import("./audio-mac.js");
 
 export type TalkOptions = {
@@ -64,12 +59,22 @@ export async function talk(opts: TalkOptions): Promise<void> {
   // TTS audio accumulator per turn.
   const ttsBuffers = new Map<string, Buffer[]>();
   let activePlayer: AbortController | null = null;
+  // FIFO play queue. Server now serializes TTS per turn so chunks arrive in
+  // order, but a turn can still produce multiple tts.done events (one per
+  // sentence). We must play them sequentially — calling startPlayback while
+  // a prior one is in flight would abort and cut audio off mid-sentence.
+  let playChain: Promise<void> = Promise.resolve();
   // Per-turn debug timing for client side.
   const ttsFirstChunkAt = new Map<string, number>();  // turnId -> timestamp of first chunk
   let lastSpeechEndAt: number | null = null;
 
-  // Start an audio playback, cancelling any in-flight one.
-  async function startPlayback(turnId: string): Promise<void> {
+  // Play a buffered audio chunk for `turnId`. Chained via `playChain` so
+  // consecutive calls queue instead of cancelling each other.
+  function enqueuePlayback(turnId: string): void {
+    playChain = playChain.then(() => runPlayback(turnId)).catch(() => { /* swallow */ });
+  }
+
+  async function runPlayback(turnId: string): Promise<void> {
     if (opts.noTts) return;
     const chunks = ttsBuffers.get(turnId);
     if (!chunks || chunks.length === 0) return;
@@ -77,7 +82,6 @@ export async function talk(opts: TalkOptions): Promise<void> {
     const buf = Buffer.concat(chunks);
     ttsBuffers.delete(turnId);
 
-    activePlayer?.abort();
     const ac = new AbortController();
     activePlayer = ac;
 
@@ -157,7 +161,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
         }
 
         case "tts.done":
-          void startPlayback(frame.turnId);
+          enqueuePlayback(frame.turnId);
           break;
 
         case "error":
@@ -191,12 +195,10 @@ export async function talk(opts: TalkOptions): Promise<void> {
       }
 
       arr.push(buf);
-
-      // Quick-start: begin playback once enough audio has buffered.
-      const total = arr.reduce((n, b) => n + b.length, 0);
-      if (total >= QUICK_START_BYTES) {
-        void startPlayback(last);
-      }
+      // No quick-start: server emits one tts.done per sentence and we play
+      // each on its tts.done. Mid-stream playback would require streaming-
+      // capable players that read a growing buffer, which afplay/ffplay
+      // don't do — they'd need a fed file or stdin pipe.
     },
 
     onClose(code, reason) {
