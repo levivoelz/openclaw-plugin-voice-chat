@@ -32,6 +32,23 @@ import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pi
 const SAMPLE_RATE = 24_000;
 const CHANNEL_ID = "voice-chat";
 
+// Debug timing — only active when VOICE_CHAT_DEBUG is set.
+const DEBUG = !!process.env["VOICE_CHAT_DEBUG"];
+
+type TurnTiming = {
+  audioStart: number;
+  audioEnd: number | null;
+  transcriptFinal: number | null;
+  dispatch: number | null;
+  firstDelta: number | null;
+  ttsStart: number | null;
+  firstTtsByte: number | null;
+};
+
+function nowMs(): number {
+  return Date.now();
+}
+
 type Logger = {
   info: (m: string) => void;
   warn: (m: string) => void;
@@ -70,6 +87,11 @@ export class VoiceSession {
   // audio exists) — gates barge-in so a phantom `speech.start` during the
   // "thinking" window doesn't destroy the in-flight reply buffer.
   private ttsActive = false;
+  // Per-turn timing map — cleaned up on agent.done or session close.
+  private turnTimings = new Map<string, TurnTiming>();
+  // Pending audio timestamps captured from speech.start/end before turnId is known.
+  private _pendingAudioStart: number | null = null;
+  private _pendingAudioEnd: number | null = null;
 
   constructor(deps: VoiceSessionDeps) {
     this.ws = deps.ws;
@@ -139,16 +161,34 @@ export class VoiceSession {
 
   handleFrame(frame: ClientFrame): void {
     switch (frame.type) {
-      case "speech.start":
+      case "speech.start": {
         // Only barge in if TTS is actually producing audio. Without this guard,
         // a `speech.start` during the agent's "thinking" window (between
         // transcript.final and tts.start) destroys the in-flight reply buffer
         // and the user never hears the response.
         if (this.d.config.interrupt && this.ttsActive) this.interruptTts();
+        if (DEBUG) {
+          // We don't have a turnId yet — use a provisional key based on time.
+          // The real per-turn timing is keyed by turnId in onFinalTranscript.
+          // Store audioStart in a pending slot; it gets promoted when the turn fires.
+          this._pendingAudioStart = nowMs();
+          this.d.logger.info(`voice-chat: speech.start t=${this._pendingAudioStart}`);
+        }
         break;
-      case "speech.end":
+      }
+      case "speech.end": {
         void this.stt?.endUtterance();
+        if (DEBUG) {
+          this._pendingAudioEnd = nowMs();
+          const audioMs = this._pendingAudioStart !== null
+            ? this._pendingAudioEnd - this._pendingAudioStart
+            : null;
+          this.d.logger.info(
+            `voice-chat: speech.end audio_ms=${audioMs ?? "?"}`,
+          );
+        }
         break;
+      }
       case "text":
         void this.onFinalTranscript(frame.content);
         break;
@@ -178,7 +218,19 @@ export class VoiceSession {
    * over-long block gets split.
    */
   deliverAgentText(text: string, turnId: string): void {
-    this.d.logger.info(`voice-chat: agent.delta turn=${turnId.slice(0, 8)} chars=${text.length} "${preview(text)}"`);
+    const shortId = turnId.slice(0, 8);
+    if (DEBUG) {
+      const tNow = nowMs();
+      const timing = this.turnTimings.get(turnId);
+      if (timing && timing.firstDelta === null) {
+        timing.firstDelta = tNow;
+        const ttftMs = timing.dispatch !== null ? tNow - timing.dispatch : null;
+        this.d.logger.info(
+          `voice-chat: agent.first_delta turn=${shortId} ttft_ms=${ttftMs ?? "?"}`,
+        );
+      }
+    }
+    this.d.logger.info(`voice-chat: agent.delta turn=${shortId} chars=${text.length} "${preview(text)}"`);
     this.send({ type: "agent.delta", text, turnId });
     this.sentenceBuf?.push(text);
   }
@@ -192,7 +244,31 @@ export class VoiceSession {
     const shortId = turnId.slice(0, 8);
     this.currentTurnId = turnId;
     this.ttsSeqByTurn.set(turnId, 0);
-    this.d.logger.info(`voice-chat: transcript.final turn=${shortId} "${preview(trimmed)}"`);
+
+    // Promote pending audio timestamps into the per-turn timing object.
+    if (DEBUG) {
+      const tNow = nowMs();
+      const timing: TurnTiming = {
+        audioStart: this._pendingAudioStart ?? tNow,
+        audioEnd: this._pendingAudioEnd,
+        transcriptFinal: tNow,
+        dispatch: null,
+        firstDelta: null,
+        ttsStart: null,
+        firstTtsByte: null,
+      };
+      this.turnTimings.set(turnId, timing);
+      const sttMs = this._pendingAudioEnd !== null ? tNow - this._pendingAudioEnd : null;
+      this.d.logger.info(
+        `voice-chat: transcript.final turn=${shortId} stt_ms=${sttMs ?? "?"} "${preview(trimmed)}"`,
+      );
+      // Reset pending slots for the next utterance.
+      this._pendingAudioStart = null;
+      this._pendingAudioEnd = null;
+    } else {
+      this.d.logger.info(`voice-chat: transcript.final turn=${shortId} "${preview(trimmed)}"`);
+    }
+
     this.send({ type: "transcript.final", text: trimmed, turnId });
 
     const ttsProv = this.d.registry.getTts(this.d.config.tts.provider)!;
@@ -210,10 +286,22 @@ export class VoiceSession {
       this.sentenceBuf?.flush();
       this.d.logger.info(`voice-chat: agent.done turn=${shortId} duration=${Date.now() - t0}ms`);
       this.send({ type: "agent.done", turnId });
+
+      if (DEBUG) {
+        const timing = this.turnTimings.get(turnId);
+        if (timing) {
+          const e2eMs = nowMs() - timing.audioStart;
+          this.d.logger.info(
+            `voice-chat: turn.complete turn=${shortId} e2e_ms=${e2eMs}`,
+          );
+          this.turnTimings.delete(turnId);
+        }
+      }
     } catch (e) {
       const err = e as Error;
       this.d.logger.error(`voice-chat: agent turn failed turn=${shortId}: ${err.message}`);
       this.sendError("AGENT_ERROR", err.message, true);
+      if (DEBUG) this.turnTimings.delete(turnId);
     } finally {
       this.pendingTurn = null;
     }
@@ -243,7 +331,21 @@ export class VoiceSession {
       // stays separate from text/main and per-client voice stays separate.
       dmScope: "per-channel-peer",
     });
-    this.d.logger.info(`voice-chat: agent.dispatch turn=${turnId.slice(0, 8)} sessionKey=${sessionKey}`);
+    if (DEBUG) {
+      const tNow = nowMs();
+      const timing = this.turnTimings.get(turnId);
+      if (timing) {
+        timing.dispatch = tNow;
+        const dispatchMs = timing.transcriptFinal !== null ? tNow - timing.transcriptFinal : null;
+        this.d.logger.info(
+          `voice-chat: agent.dispatch turn=${turnId.slice(0, 8)} dispatch_ms=${dispatchMs ?? "?"} sessionKey=${sessionKey}`,
+        );
+      } else {
+        this.d.logger.info(`voice-chat: agent.dispatch turn=${turnId.slice(0, 8)} sessionKey=${sessionKey}`);
+      }
+    } else {
+      this.d.logger.info(`voice-chat: agent.dispatch turn=${turnId.slice(0, 8)} sessionKey=${sessionKey}`);
+    }
 
     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
       Body: transcript,
@@ -316,7 +418,23 @@ export class VoiceSession {
     this.ttsActive = true;
     try {
       const fmt: AudioFormat = this.d.config.tts.format;
-      this.d.logger.info(`voice-chat: tts.start turn=${shortId} chars=${text.length} voice=${this.d.config.tts.voice ?? "?"}`);
+
+      if (DEBUG) {
+        const tNow = nowMs();
+        const timing = this.turnTimings.get(turnId);
+        if (timing) {
+          timing.ttsStart = tNow;
+          const fromFirstDeltaMs = timing.firstDelta !== null ? tNow - timing.firstDelta : null;
+          this.d.logger.info(
+            `voice-chat: tts.start turn=${shortId} chars=${text.length} voice=${this.d.config.tts.voice ?? "?"} from_first_delta_ms=${fromFirstDeltaMs ?? "?"}`,
+          );
+        } else {
+          this.d.logger.info(`voice-chat: tts.start turn=${shortId} chars=${text.length} voice=${this.d.config.tts.voice ?? "?"}`);
+        }
+      } else {
+        this.d.logger.info(`voice-chat: tts.start turn=${shortId} chars=${text.length} voice=${this.d.config.tts.voice ?? "?"}`);
+      }
+
       const stream = ttsProv.synthesize({
         text,
         model: this.d.config.tts.model,
@@ -326,11 +444,26 @@ export class VoiceSession {
         signal,
       });
       let totalBytes = 0;
+      let firstByteLogged = false;
       for await (const { chunk } of stream) {
         if (signal.aborted || this.closed) return;
         const seq = (this.ttsSeqByTurn.get(turnId) ?? 0) + 1;
         this.ttsSeqByTurn.set(turnId, seq);
         totalBytes += chunk.byteLength;
+
+        if (DEBUG && !firstByteLogged) {
+          firstByteLogged = true;
+          const tNow = nowMs();
+          const timing = this.turnTimings.get(turnId);
+          if (timing) {
+            timing.firstTtsByte = tNow;
+            const firstByteMs = timing.ttsStart !== null ? tNow - timing.ttsStart : null;
+            this.d.logger.info(
+              `voice-chat: tts.first_byte turn=${shortId} ms=${firstByteMs ?? "?"}`,
+            );
+          }
+        }
+
         this.send({ type: "tts.chunk", turnId, seq, format: fmt });
         this.ws.send(chunk, { binary: true });
       }
@@ -372,6 +505,7 @@ export class VoiceSession {
     this.closed = true;
     this.d.logger.info(`voice-chat: session closed client=${this.d.clientId}`);
     this.interruptTts();
+    this.turnTimings.clear();
     void this.stt?.close();
     this.stt = null;
     if (this.ws.readyState === this.ws.OPEN || this.ws.readyState === this.ws.CONNECTING) {

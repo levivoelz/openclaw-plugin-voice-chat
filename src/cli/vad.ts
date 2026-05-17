@@ -31,6 +31,9 @@ export type VadOptions = {
   minPeakRms?: number;
 };
 
+// Only emit the high-volume RMS dump when the env value is exactly "vad".
+const VAD_TRACE = process.env["VOICE_CHAT_DEBUG"] === "vad";
+
 const DEFAULTS: Required<VadOptions> = {
   sampleRate: 24000,
   threshold: 0.03,
@@ -67,6 +70,11 @@ export class Vad {
     const rms = computeRms(pcm);
     const isSpeech = rms >= this.opts.threshold;
     const bytes = pcm.byteLength;
+    if (VAD_TRACE) {
+      process.stderr.write(
+        `[vad] rms=${rms.toFixed(3)} state=${this.state} aboveStreak=${this.aboveStreak} belowStreak=${this.belowStreak}\n`,
+      );
+    }
 
     if (this.state === "idle") {
       // Keep a rolling pre-roll buffer so the first detected word isn't clipped.

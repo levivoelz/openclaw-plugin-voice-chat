@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -98,25 +98,37 @@ function spawnDaemon(cfg: Required<ParakeetConfig>): void {
       stdio: "ignore",
     },
   );
+  if (PARAKEET_DEBUG && child.pid !== undefined) {
+    process.stderr.write(`[parakeet] daemon spawn pid=${child.pid}\n`);
+  }
   child.unref();
 }
 
 function resolvePython(): string {
-  // If the uv tool's python is available, prefer it (it has parakeet_mlx).
-  // Otherwise use system python3 and rely on the daemon's own PATH search.
-  const candidates = [
-    "/Users/iris/.local/share/uv/tools/parakeet-mlx/bin/python3",
-    "/Users/iris/.local/share/uv/tools/parakeet-mlx/bin/python",
-    "python3",
-  ];
-  for (const c of candidates) {
-    if (c === "python3") return c; // system fallback
-    if (existsSync(c)) return c;
-  }
+  // Derive python3 path from the uv-installed parakeet-mlx binary so it has
+  // parakeet_mlx on its sys.path. Fall back to system python3 if not found.
+  try {
+    const binaryPath = execFileSync("which", ["parakeet-mlx"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+    if (binaryPath) {
+      // parakeet-mlx binary lives in the uv tool's bin/. The virtualenv python
+      // is in the same bin/ directory.
+      const toolBin = dirname(binaryPath);
+      for (const name of ["python3", "python"]) {
+        const candidate = join(toolBin, name);
+        if (existsSync(candidate)) return candidate;
+      }
+    }
+  } catch { /* not found on PATH */ }
   return "python3";
 }
 
 // ─── Socket transport ─────────────────────────────────────────────────────────
+
+const PARAKEET_DEBUG = !!process.env["VOICE_CHAT_DEBUG"];
 
 /**
  * Send PCM audio to the daemon over a Unix socket. Returns the transcribed
@@ -129,6 +141,7 @@ function transcribeViaDaemon(
   sampleRate: number,
   socketPath: string,
 ): Promise<string> {
+  const t0 = Date.now();
   return new Promise<string>((resolve, reject) => {
     const payload = JSON.stringify({
       audio_pcm_b64: pcm.toString("base64"),
@@ -138,6 +151,7 @@ function transcribeViaDaemon(
     let sock: Socket | null = null;
     let settled = false;
     let recvBuf = "";
+    let connectMs: number | null = null;
 
     const connectTimer = setTimeout(() => {
       if (!settled) {
@@ -156,7 +170,13 @@ function transcribeViaDaemon(
       if (inferTimer.ref) clearTimeout(inferTimer.ref);
       sock?.destroy();
       if (err) reject(err);
-      else resolve(text!);
+      else {
+        if (PARAKEET_DEBUG) {
+          const roundTripMs = Date.now() - t0;
+          process.stderr.write(`[parakeet] socket round-trip ms=${roundTripMs}\n`);
+        }
+        resolve(text!);
+      }
     }
 
     try {
@@ -168,6 +188,10 @@ function transcribeViaDaemon(
     }
 
     sock.on("connect", () => {
+      connectMs = Date.now() - t0;
+      if (PARAKEET_DEBUG) {
+        process.stderr.write(`[parakeet] socket connect ms=${connectMs}\n`);
+      }
       clearTimeout(connectTimer);
       // Start inference timeout once connected.
       inferTimer.ref = setTimeout(() => {

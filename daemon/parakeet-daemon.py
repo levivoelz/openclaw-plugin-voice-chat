@@ -2,21 +2,23 @@
 """
 Parakeet MLX inference daemon.
 
-Loads the model once at startup, then serves transcription requests over a
-Unix domain socket at /tmp/openclaw-parakeet.sock.
+Loads the model once (on the inference thread) at startup, then serves
+transcription requests over a Unix domain socket at /tmp/openclaw-parakeet.sock.
+
+MLX requires that all GPU/Metal operations run on the same OS thread that
+created the MLX context. To satisfy this, the model is loaded and all
+transcription work happens exclusively on the inference worker thread.
 
 Request  (newline-terminated JSON):
-  {"audio_pcm_b64": "<base64-encoded PCM16 mono>", "sample_rate": 24000}
+  {"audio_pcm_b64": "<base64-encoded PCM16 mono>", "sample_rate": 16000}
 
 Response (newline-terminated JSON):
   {"text": "transcribed text"}          — success
   {"error": "message"}                  — failure
 
-Concurrency: requests are serialized through a queue; inference is
-single-threaded (MLX/Metal is not safely reentrant from multiple threads).
-
 Usage:
-  python3 parakeet-daemon.py [--model mlx-community/parakeet-tdt-0.6b-v3] [--socket /tmp/openclaw-parakeet.sock]
+  python3 parakeet-daemon.py [--model mlx-community/parakeet-tdt-0.6b-v3] \
+                              [--socket /tmp/openclaw-parakeet.sock]
 """
 
 import argparse
@@ -26,11 +28,13 @@ import logging
 import os
 import queue
 import socket
-import struct
 import sys
 import tempfile
 import threading
+import time
+import traceback
 import wave
+from concurrent.futures import Future
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -48,99 +52,112 @@ DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# parakeet_mlx import helper
 # ---------------------------------------------------------------------------
-def load_model(model_id: str):
-    """Import parakeet_mlx from the uv tool environment and load the model."""
-    log.info("Loading model %s …", model_id)
+def _ensure_parakeet_on_path() -> None:
+    """Add the uv tool's site-packages to sys.path if needed."""
     try:
-        import parakeet_mlx
+        import parakeet_mlx  # noqa: F401
+        return
     except ModuleNotFoundError:
-        # The daemon might be launched without the uv tool env on PYTHONPATH.
-        # Try to find it relative to the parakeet-mlx binary on PATH.
-        import shutil
-        binary = shutil.which("parakeet-mlx")
-        if binary:
-            # binary is e.g. /Users/iris/.local/bin/parakeet-mlx
-            # site-packages is sibling of bin: …/tools/parakeet-mlx/lib/pythonX.Y/site-packages
-            bin_dir = Path(binary).resolve().parent
-            tool_dir = bin_dir.parent  # e.g. /Users/iris/.local/share/uv/tools/parakeet-mlx
-            # Walk up to the uv tool virtualenv root and find site-packages
-            for sp in tool_dir.glob("lib/python*/site-packages"):
-                if sp not in sys.path:
-                    sys.path.insert(0, str(sp))
-                break
-        import parakeet_mlx  # noqa: F811 — re-import after path fix
+        pass
 
-    model = parakeet_mlx.from_pretrained(model_id)
-    log.info("Model loaded.")
-    return model
+    import shutil
+    binary = shutil.which("parakeet-mlx")
+    if binary:
+        bin_dir = Path(binary).resolve().parent
+        tool_dir = bin_dir.parent
+        for sp in tool_dir.glob("lib/python*/site-packages"):
+            if str(sp) not in sys.path:
+                sys.path.insert(0, str(sp))
+            break
+
+    import parakeet_mlx  # noqa: F401 — re-import to verify
 
 
 # ---------------------------------------------------------------------------
-# Transcription helper
-# ---------------------------------------------------------------------------
-def transcribe_pcm(model, pcm_bytes: bytes, sample_rate: int) -> str:
-    """Write PCM16 mono bytes to a temp WAV, transcribe, return text."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp_path = f.name
-
-    try:
-        # Write a minimal WAV file.
-        with wave.open(tmp_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit = 2 bytes
-            wf.setframerate(sample_rate)
-            wf.writeframes(pcm_bytes)
-
-        result = model.transcribe(tmp_path)
-        return result.text.strip()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Request worker (runs in its own thread, owns the model)
+# Inference worker
 # ---------------------------------------------------------------------------
 class InferenceWorker(threading.Thread):
-    """Serializes inference requests through an internal queue."""
+    """
+    Owns the MLX model and all GPU work.
 
-    def __init__(self, model):
+    The model is loaded inside run() so MLX's Metal context is created on
+    this thread. All inference also happens here — MLX is not thread-safe
+    across OS threads.
+    """
+
+    def __init__(self, model_id: str):
         super().__init__(daemon=True, name="inference-worker")
-        self._model = model
+        self._model_id = model_id
         self._queue: queue.Queue = queue.Queue()
+        self._ready = threading.Event()
+        self._load_error: Exception | None = None
 
-    def submit(self, pcm_bytes: bytes, sample_rate: int) -> "threading.Future[str]":
-        """Submit a transcription job and return a Future for the result."""
-        fut: threading.Future = concurrent_futures_Future()
+    def wait_until_ready(self, timeout: float = 300.0) -> None:
+        """Block until the model is loaded (or raises if load failed)."""
+        if not self._ready.wait(timeout):
+            raise TimeoutError("Model failed to load within timeout.")
+        if self._load_error is not None:
+            raise self._load_error
+
+    def submit(self, pcm_bytes: bytes, sample_rate: int) -> "Future[str]":
+        """Submit a transcription job. Returns a Future for the result."""
+        fut: Future = Future()
         self._queue.put((pcm_bytes, sample_rate, fut))
         return fut
 
     def run(self):
+        # ── Load model on this thread ────────────────────────────────────
+        try:
+            _ensure_parakeet_on_path()
+            import parakeet_mlx
+            log.info("Loading model %s …", self._model_id)
+            t_load_start = time.monotonic()
+            self._model = parakeet_mlx.from_pretrained(self._model_id)
+            load_ms = int((time.monotonic() - t_load_start) * 1000)
+            log.info("model loaded model=%s load_ms=%d", self._model_id, load_ms)
+        except Exception as exc:
+            self._load_error = exc
+            self._ready.set()
+            log.error("Model load failed: %s", exc)
+            return
+
+        self._ready.set()
+
+        # ── Inference loop ───────────────────────────────────────────────
         while True:
             pcm_bytes, sample_rate, fut = self._queue.get()
             try:
-                text = transcribe_pcm(self._model, pcm_bytes, sample_rate)
+                text = self._transcribe(pcm_bytes, sample_rate)
                 fut.set_result(text)
             except Exception as exc:
                 fut.set_exception(exc)
 
-
-def concurrent_futures_Future():
-    """Lazy import to avoid pulling in concurrent.futures at module level."""
-    from concurrent.futures import Future
-    return Future()
+    def _transcribe(self, pcm_bytes: bytes, sample_rate: int) -> str:
+        """Write a temp WAV, run model.transcribe(), return text."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit = 2 bytes
+                wf.setframerate(sample_rate)
+                wf.writeframes(pcm_bytes)
+            result = self._model.transcribe(tmp_path)
+            return result.text.strip()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Connection handler — one thread per client connection
+# Connection handler
 # ---------------------------------------------------------------------------
-def handle_connection(conn: socket.socket, worker: InferenceWorker):
-    peer = conn.getpeername() if hasattr(conn, "getpeername") else "unix"
-    log.debug("Client connected: %s", peer)
+def handle_connection(conn: socket.socket, worker: InferenceWorker, addr: str):
+    log.debug("client connected addr=%s", addr)
     try:
         buf = b""
         while True:
@@ -148,23 +165,21 @@ def handle_connection(conn: socket.socket, worker: InferenceWorker):
             if not chunk:
                 break
             buf += chunk
-            # A request is a single JSON line terminated by \n.
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 line = line.strip()
-                if not line:
-                    continue
-                _handle_request(conn, worker, line)
+                if line:
+                    _handle_request(conn, worker, line)
     except (ConnectionResetError, BrokenPipeError):
         pass
     except Exception as exc:
-        log.warning("Connection error: %s", exc)
+        log.warning("Connection error addr=%s: %s", addr, exc)
     finally:
         try:
             conn.close()
         except OSError:
             pass
-        log.debug("Client disconnected.")
+        log.debug("client disconnected addr=%s", addr)
 
 
 def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes):
@@ -175,7 +190,7 @@ def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes):
         return
 
     audio_b64 = req.get("audio_pcm_b64")
-    sample_rate = req.get("sample_rate", 16000)
+    sample_rate = int(req.get("sample_rate", 16000))
 
     if not audio_b64:
         _send_json(conn, {"error": "missing audio_pcm_b64"})
@@ -191,14 +206,25 @@ def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes):
         _send_json(conn, {"error": "audio too short"})
         return
 
-    log.debug("Queuing transcription: %d PCM bytes @ %d Hz", len(pcm_bytes), sample_rate)
+    n_bytes = len(pcm_bytes)
+    log.debug("req received bytes=%d sr=%d", n_bytes, sample_rate)
+    t_req_start = time.monotonic()
     fut = worker.submit(pcm_bytes, sample_rate)
     try:
         text = fut.result(timeout=120)
+        infer_ms = int((time.monotonic() - t_req_start) * 1000)
+        preview = text[:60].replace("\n", " ") if text else ""
+        log.debug(
+            'req done bytes=%d sr=%d infer_ms=%d text_chars=%d text="%s"',
+            n_bytes, sample_rate, infer_ms, len(text), preview,
+        )
         _send_json(conn, {"text": text})
     except TimeoutError:
+        log.warning("req timeout bytes=%d sr=%d", n_bytes, sample_rate)
         _send_json(conn, {"error": "inference timeout"})
     except Exception as exc:
+        tb_summary = traceback.format_exc().splitlines()[-1]
+        log.warning("req error bytes=%d sr=%d err=%s tb=%s", n_bytes, sample_rate, exc, tb_summary)
         _send_json(conn, {"error": str(exc)})
 
 
@@ -219,16 +245,16 @@ def run_server(socket_path: str, worker: InferenceWorker):
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(socket_path)
-    # Restrict to current user only.
     os.chmod(socket_path, 0o600)
     server.listen(16)
     log.info("Listening on %s", socket_path)
 
     try:
         while True:
-            conn, _ = server.accept()
+            conn, addr = server.accept()
+            addr_str = str(addr) if addr else "<unix>"
             t = threading.Thread(
-                target=handle_connection, args=(conn, worker), daemon=True
+                target=handle_connection, args=(conn, worker, addr_str), daemon=True
             )
             t.start()
     except KeyboardInterrupt:
@@ -247,22 +273,27 @@ def run_server(socket_path: str, worker: InferenceWorker):
 def main():
     parser = argparse.ArgumentParser(description="Parakeet MLX inference daemon")
     parser.add_argument(
-        "--model", default=DEFAULT_MODEL, help="HuggingFace model ID (default: %(default)s)"
+        "--model", default=DEFAULT_MODEL,
+        help="HuggingFace model ID (default: %(default)s)",
     )
     parser.add_argument(
-        "--socket", default=SOCKET_PATH, help="Unix socket path (default: %(default)s)"
+        "--socket", default=SOCKET_PATH,
+        help="Unix socket path (default: %(default)s)",
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable debug logging"
+        "--verbose", "-v", action="store_true", help="Enable debug logging",
     )
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    model = load_model(args.model)
-    worker = InferenceWorker(model)
+    worker = InferenceWorker(args.model)
     worker.start()
+
+    log.info("Waiting for model to load …")
+    worker.wait_until_ready()  # blocks until ready or raises
+
     run_server(args.socket, worker)
 
 

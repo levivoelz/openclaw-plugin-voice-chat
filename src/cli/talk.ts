@@ -64,6 +64,9 @@ export async function talk(opts: TalkOptions): Promise<void> {
   // TTS audio accumulator per turn.
   const ttsBuffers = new Map<string, Buffer[]>();
   let activePlayer: AbortController | null = null;
+  // Per-turn debug timing for client side.
+  const ttsFirstChunkAt = new Map<string, number>();  // turnId -> timestamp of first chunk
+  let lastSpeechEndAt: number | null = null;
 
   // Start an audio playback, cancelling any in-flight one.
   async function startPlayback(turnId: string): Promise<void> {
@@ -77,12 +80,31 @@ export async function talk(opts: TalkOptions): Promise<void> {
     activePlayer?.abort();
     const ac = new AbortController();
     activePlayer = ac;
+
+    const playbackStart = Date.now();
+    if (opts.debug) {
+      const firstChunkAt = ttsFirstChunkAt.get(turnId);
+      const msSinceFirstChunk = firstChunkAt !== null && firstChunkAt !== undefined
+        ? playbackStart - firstChunkAt
+        : null;
+      process.stderr.write(
+        `[debug] playback start turn=${turnId.slice(0, 8)} ms_since_first_chunk=${msSinceFirstChunk ?? "?"}\n`,
+      );
+    }
+
     try {
       await play({ audio: buf, format: opts.format, signal: ac.signal });
+      if (opts.debug) {
+        const totalMs = Date.now() - playbackStart;
+        process.stderr.write(
+          `[debug] playback done turn=${turnId.slice(0, 8)} total_ms=${totalMs}\n`,
+        );
+      }
     } catch {
       // swallow player errors in normal mode
     } finally {
       if (activePlayer === ac) activePlayer = null;
+      ttsFirstChunkAt.delete(turnId);
     }
   }
 
@@ -157,6 +179,17 @@ export async function talk(opts: TalkOptions): Promise<void> {
       const last = [...ttsBuffers.keys()].at(-1);
       if (!last) return;
       const arr = ttsBuffers.get(last)!;
+
+      // Log first chunk timing per turn.
+      if (opts.debug && !ttsFirstChunkAt.has(last)) {
+        const now = Date.now();
+        ttsFirstChunkAt.set(last, now);
+        const msSinceSpeechEnd = lastSpeechEndAt !== null ? now - lastSpeechEndAt : null;
+        process.stderr.write(
+          `[debug] tts first-chunk turn=${last.slice(0, 8)} ms_since_speech_end=${msSinceSpeechEnd ?? "?"}\n`,
+        );
+      }
+
       arr.push(buf);
 
       // Quick-start: begin playback once enough audio has buffered.
@@ -264,10 +297,15 @@ export async function talk(opts: TalkOptions): Promise<void> {
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
 
+    const VAD_SAMPLE_RATE = 24000;
     const recorder = startVadRecording({
-      sampleRate: 24000,
+      sampleRate: VAD_SAMPLE_RATE,
       onUtterance: (pcm) => {
+        const durationMs = Math.round((pcm.byteLength / 2) / VAD_SAMPLE_RATE * 1000);
         if (opts.print) process.stderr.write(`${ANSI_DIM}[vad] utterance ${pcm.byteLength} bytes${ANSI_RESET}\n`);
+        if (opts.debug) {
+          process.stderr.write(`[debug] vad utterance bytes=${pcm.byteLength} duration_ms=${durationMs}\n`);
+        }
         sendFrame(ws, { type: "speech.start" });
         // Chunk into 16KB frames so the server can pipeline.
         const CHUNK = 16 * 1024;
@@ -275,6 +313,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
           ws.send(pcm.subarray(i, Math.min(i + CHUNK, pcm.byteLength)), { binary: true });
         }
         sendFrame(ws, { type: "speech.end" });
+        if (opts.debug) lastSpeechEndAt = Date.now();
       },
       onError: (e) => process.stderr.write(`Mic error: ${e.message}\n`),
     });
