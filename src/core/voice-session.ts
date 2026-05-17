@@ -26,7 +26,7 @@ import { getVoiceChatRuntime } from "../channel-runtime.js";
 // Top-level import — NOT on runtime. The runtime only carries
 // finalizeInboundContext + dispatchReplyWithBufferedBlockDispatcher (which
 // we still access via runtime.channel.reply).
-import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-core";
+import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 
 // 24 kHz: minimum accepted by OpenAI Realtime, also fine for Whisper.
 const SAMPLE_RATE = 24_000;
