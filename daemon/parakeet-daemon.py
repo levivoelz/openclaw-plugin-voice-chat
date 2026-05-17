@@ -129,13 +129,18 @@ class InferenceWorker(threading.Thread):
         while True:
             pcm_bytes, sample_rate, fut = self._queue.get()
             try:
-                text = self._transcribe(pcm_bytes, sample_rate)
-                fut.set_result(text)
+                result = self._transcribe(pcm_bytes, sample_rate)
+                fut.set_result(result)
             except Exception as exc:
                 fut.set_exception(exc)
 
-    def _transcribe(self, pcm_bytes: bytes, sample_rate: int) -> str:
-        """Write a temp WAV, run model.transcribe(), return text."""
+    def _transcribe(self, pcm_bytes: bytes, sample_rate: int) -> dict:
+        """Write a temp WAV, run model.transcribe(), return {text, confidence}.
+
+        Confidence is the model's entropy-based certainty for the transcription
+        (closer to 1.0 = more confident). For parakeet-tdt, real speech
+        typically scores >0.9 while hallucinations on noise/silence score
+        lower — the Node side uses this to drop hallucinated transcripts."""
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_path = f.name
         try:
@@ -145,12 +150,32 @@ class InferenceWorker(threading.Thread):
                 wf.setframerate(sample_rate)
                 wf.writeframes(pcm_bytes)
             result = self._model.transcribe(tmp_path)
-            return result.text.strip()
+            # Confidence is per-token; aggregate by averaging across sentences.
+            # The parakeet-mlx AlignedResult exposes .sentences[].tokens[].confidence.
+            confidence = _avg_confidence(result)
+            return {"text": result.text.strip(), "confidence": confidence}
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _avg_confidence(result) -> float | None:
+    """Mean per-token confidence across all sentences in an AlignedResult.
+    Returns None if the result shape doesn't expose token-level confidence."""
+    try:
+        confs = []
+        for sentence in getattr(result, "sentences", []) or []:
+            for tok in getattr(sentence, "tokens", []) or []:
+                c = getattr(tok, "confidence", None)
+                if isinstance(c, (int, float)):
+                    confs.append(float(c))
+        if not confs:
+            return None
+        return sum(confs) / len(confs)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -211,14 +236,16 @@ def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes):
     t_req_start = time.monotonic()
     fut = worker.submit(pcm_bytes, sample_rate)
     try:
-        text = fut.result(timeout=120)
+        result = fut.result(timeout=120)
+        text = result["text"]
+        confidence = result.get("confidence")
         infer_ms = int((time.monotonic() - t_req_start) * 1000)
         preview = text[:60].replace("\n", " ") if text else ""
         log.debug(
-            'req done bytes=%d sr=%d infer_ms=%d text_chars=%d text="%s"',
-            n_bytes, sample_rate, infer_ms, len(text), preview,
+            'req done bytes=%d sr=%d infer_ms=%d text_chars=%d conf=%s text="%s"',
+            n_bytes, sample_rate, infer_ms, len(text), confidence, preview,
         )
-        _send_json(conn, {"text": text})
+        _send_json(conn, {"text": text, "confidence": confidence})
     except TimeoutError:
         log.warning("req timeout bytes=%d sr=%d", n_bytes, sample_rate)
         _send_json(conn, {"error": "inference timeout"})

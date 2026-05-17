@@ -57,6 +57,10 @@ type ParakeetConfig = {
   model?: string;
   daemonSocket?: string;
   daemonBin?: string;
+  /** Drop transcripts whose mean per-token confidence falls below this.
+   *  Real speech scores ~0.95+; hallucinations on ambient noise typically
+   *  score 0.6–0.85. Set to 0 to disable. Default 0.85. */
+  minConfidence?: number;
 };
 
 function readParakeetConfig(cfg: Record<string, unknown>): Required<ParakeetConfig> {
@@ -66,6 +70,7 @@ function readParakeetConfig(cfg: Record<string, unknown>): Required<ParakeetConf
     model: p.model ?? "mlx-community/parakeet-tdt-0.6b-v3",
     daemonSocket: p.daemonSocket ?? SOCKET_PATH,
     daemonBin: p.daemonBin ?? DAEMON_SCRIPT,
+    minConfidence: typeof p.minConfidence === "number" ? p.minConfidence : 0.85,
   };
 }
 
@@ -136,13 +141,15 @@ const PARAKEET_DEBUG = !!process.env["VOICE_CHAT_DEBUG"];
  *
  * Timeout: 10 s connect + 60 s inference.
  */
+export type TranscribeResult = { text: string; confidence: number | null };
+
 function transcribeViaDaemon(
   pcm: Buffer,
   sampleRate: number,
   socketPath: string,
-): Promise<string> {
+): Promise<TranscribeResult> {
   const t0 = Date.now();
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<TranscribeResult>((resolve, reject) => {
     const payload = JSON.stringify({
       audio_pcm_b64: pcm.toString("base64"),
       sample_rate: sampleRate,
@@ -163,7 +170,7 @@ function transcribeViaDaemon(
 
     const inferTimer = { ref: null as ReturnType<typeof setTimeout> | null };
 
-    function done(err: Error | null, text?: string) {
+    function done(err: Error | null, result?: TranscribeResult) {
       if (settled) return;
       settled = true;
       clearTimeout(connectTimer);
@@ -175,7 +182,7 @@ function transcribeViaDaemon(
           const roundTripMs = Date.now() - t0;
           process.stderr.write(`[parakeet] socket round-trip ms=${roundTripMs}\n`);
         }
-        resolve(text!);
+        resolve(result!);
       }
     }
 
@@ -206,11 +213,11 @@ function transcribeViaDaemon(
       if (nl === -1) return;
       const line = recvBuf.slice(0, nl).trim();
       try {
-        const resp = JSON.parse(line) as { text?: string; error?: string };
+        const resp = JSON.parse(line) as { text?: string; confidence?: number | null; error?: string };
         if (resp.error) {
           done(new Error(`parakeet-daemon: ${resp.error}`));
         } else {
-          done(null, (resp.text ?? "").trim());
+          done(null, { text: (resp.text ?? "").trim(), confidence: resp.confidence ?? null });
         }
       } catch (e) {
         done(new Error(`parakeet-daemon: bad response JSON: ${line}`));
@@ -231,12 +238,12 @@ function transcribeViaCli(
   sampleRate: number,
   cfg: Required<ParakeetConfig>,
   timeoutMs: number,
-): Promise<string> {
+): Promise<TranscribeResult> {
   const dir = mkdtempSync(join(tmpdir(), "parakeet-"));
   const wavPath = join(dir, `${randomUUID()}.wav`);
   writeFileSync(wavPath, wrapPcm16AsWav(pcm, sampleRate));
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<TranscribeResult>((resolve, reject) => {
     const proc = spawn(cfg.binary, [
       wavPath,
       "--output-format", "json",
@@ -263,7 +270,8 @@ function transcribeViaCli(
         const jsonFile = readdirSync(dir).find((f) => f.endsWith(".json"));
         if (!jsonFile) { reject(new Error("parakeet-mlx produced no JSON output")); return; }
         const parsed = JSON.parse(readFileSync(join(dir, jsonFile), "utf8")) as { text?: string };
-        resolve((parsed.text ?? "").trim());
+        // CLI fallback doesn't expose token-level confidence — return null.
+        resolve({ text: (parsed.text ?? "").trim(), confidence: null });
       } finally {
         try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
@@ -282,7 +290,7 @@ async function transcribe(
   sampleRate: number,
   cfg: Required<ParakeetConfig>,
   timeoutMs: number,
-): Promise<string> {
+): Promise<TranscribeResult> {
   try {
     return await transcribeViaDaemon(pcm, sampleRate, cfg.daemonSocket);
   } catch {
@@ -316,8 +324,26 @@ function createSession(opts: SttCreateOptions): SttSession {
       const pcm = Buffer.concat(buf);
       buf = [];
       try {
-        const text = await transcribe(pcm, sampleRate, cfg, 60_000);
-        if (text && callbacks.onFinal) callbacks.onFinal(text);
+        const { text, confidence } = await transcribe(pcm, sampleRate, cfg, 60_000);
+        if (!text) return;
+        // Drop low-confidence transcripts. Parakeet (like every CTC/transducer
+        // model) confidently hallucinates plausible English when fed sustained
+        // non-speech audio (HVAC, breathing, typing). Its own per-token
+        // confidence is the right signal — entropy is high on those outputs.
+        // CLI fallback returns null confidence; never drop in that case.
+        if (
+          confidence !== null &&
+          cfg.minConfidence > 0 &&
+          confidence < cfg.minConfidence
+        ) {
+          if (PARAKEET_DEBUG) {
+            process.stderr.write(
+              `[parakeet] dropping low-confidence transcript conf=${confidence.toFixed(3)} text="${text.slice(0, 60)}"\n`,
+            );
+          }
+          return;
+        }
+        callbacks.onFinal?.(text);
       } catch (e) {
         callbacks.onError?.(e instanceof Error ? e : new Error(String(e)));
       }

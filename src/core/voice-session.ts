@@ -77,9 +77,15 @@ export class VoiceSession {
   private readonly ws: WebSocket;
   private readonly d: VoiceSessionDeps;
   private stt: SttSession | null = null;
-  private sentenceBuf: SentenceBuffer | null = null;
+  // Per-turn sentence buffer. Single-buffer design corrupted audio when a
+  // late deliver from turn N arrived after turn N+1 had started — the late
+  // text would land in turn N+1's buffer and get synthesized under turn N+1's
+  // id. Keyed by turnId so each turn's text routes to its own pipeline.
+  private sentenceBufs = new Map<string, SentenceBuffer>();
   private currentTurnId: string | null = null;
-  private ttsAbort: AbortController | null = null;
+  // Per-turn abort controller. Aborting only stops streaming TTS — the agent
+  // dispatch keeps running because runPrepared doesn't accept a signal yet.
+  private ttsAborts = new Map<string, AbortController>();
   private closed = false;
   private ttsSeqByTurn = new Map<string, number>();
   private pendingTurn: Promise<void> | null = null;
@@ -239,7 +245,10 @@ export class VoiceSession {
     }
     this.d.logger.info(`voice-chat: agent.delta turn=${shortId} chars=${text.length} "${preview(text)}"`);
     this.send({ type: "agent.delta", text, turnId });
-    this.sentenceBuf?.push(text);
+    // Push to THIS turn's buffer. If the turn was canceled/superseded the
+    // entry was deleted and the late text is dropped — preventing it from
+    // bleeding into a newer turn's audio.
+    this.sentenceBufs.get(turnId)?.push(text);
   }
 
   private async onFinalTranscript(text: string): Promise<void> {
@@ -279,26 +288,34 @@ export class VoiceSession {
 
     this.send({ type: "transcript.final", text: trimmed, turnId });
 
+    // A new transcript supersedes any prior turn — abort its TTS streams and
+    // drop its sentence buffer so leftover text from the previous LLM dispatch
+    // can't bleed into this turn. The prior agent dispatch may still finish in
+    // the background, but its late deliveries land in a now-missing buffer
+    // entry (deliverAgentText silently no-ops) instead of corrupting this turn.
+    this.abortPriorTurns(turnId);
+
     const ttsProv = this.d.registry.getTts(this.d.config.tts.provider)!;
-    this.ttsAbort = new AbortController();
-    const ttsAbort = this.ttsAbort;
+    const ttsAbort = new AbortController();
+    this.ttsAborts.set(turnId, ttsAbort);
 
     // Chain speak() calls so one chunk's TTS finishes (all binary frames
     // pushed to the wire) before the next begins. Without this, multiple
     // chunks emitted in quick succession run N parallel TTS streams that
     // interleave MP3 bytes on the wire and produce garbled playback.
     let speakChain: Promise<void> = Promise.resolve();
-    this.sentenceBuf = new SentenceBuffer((chunk) => {
+    const sb = new SentenceBuffer((chunk) => {
       speakChain = speakChain.then(() =>
         this.speak(chunk, turnId, ttsProv, ttsAbort.signal),
       ).catch(() => { /* swallow to keep chain alive */ });
     });
+    this.sentenceBufs.set(turnId, sb);
 
     const t0 = Date.now();
     try {
       this.pendingTurn = this.runChannelTurn(trimmed, turnId);
       await this.pendingTurn;
-      this.sentenceBuf?.flush();
+      sb.flush();
       this.d.logger.info(`voice-chat: agent.done turn=${shortId} duration=${Date.now() - t0}ms`);
       this.send({ type: "agent.done", turnId });
 
@@ -520,12 +537,32 @@ export class VoiceSession {
   }
 
   private interruptTts(): void {
-    if (this.ttsAbort) {
-      this.ttsAbort.abort();
-      this.ttsAbort = null;
+    for (const ac of this.ttsAborts.values()) ac.abort();
+    this.ttsAborts.clear();
+    for (const sb of this.sentenceBufs.values()) sb.close();
+    this.sentenceBufs.clear();
+    this.ttsActive = false;
+  }
+
+  /**
+   * Abort and discard every turn except `keepTurnId`. Called when a new
+   * transcript arrives so the prior turn's in-flight TTS doesn't continue
+   * playing — and its late agent deliveries land in a missing buffer entry
+   * (deliverAgentText silently no-ops) instead of bleeding into the new turn.
+   */
+  private abortPriorTurns(keepTurnId: string): void {
+    for (const [tid, ac] of this.ttsAborts) {
+      if (tid !== keepTurnId) ac.abort();
     }
-    this.sentenceBuf?.close();
-    this.sentenceBuf = null;
+    for (const [tid, sb] of this.sentenceBufs) {
+      if (tid !== keepTurnId) sb.close();
+    }
+    for (const tid of [...this.ttsAborts.keys()]) {
+      if (tid !== keepTurnId) this.ttsAborts.delete(tid);
+    }
+    for (const tid of [...this.sentenceBufs.keys()]) {
+      if (tid !== keepTurnId) this.sentenceBufs.delete(tid);
+    }
     this.ttsActive = false;
   }
 
