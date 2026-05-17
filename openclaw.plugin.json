@@ -80,8 +80,8 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "provider": { "type": "string", "default": "voice-chat/openai-whisper" },
-              "model":    { "type": "string", "default": "whisper-1" },
+              "provider": { "type": "string", "default": "voice-chat/openai-realtime" },
+              "model":    { "type": "string", "default": "gpt-4o-transcribe" },
               "language": { "type": "string" }
             }
           },

@@ -39,16 +39,15 @@ export function startRecording(opts: {
 }
 
 /**
- * VAD recording: sox silence effect gates utterances.
- * Each detected utterance is collected into a buffer and emitted via onUtterance.
+ * VAD recording: continuous mic capture, no client-side silence detection.
+ * Server-side VAD (OpenAI Realtime turn_detection) handles utterance
+ * boundaries. We just stream PCM out as fast as sox produces it.
  */
 export function startVadRecording(opts: {
   sampleRate: number;
   onUtterance: (pcm: Buffer) => void;
   onError: (e: Error) => void;
 }): { stop: () => void } {
-  // silence 1 <above_periods> <above_thresh>  1 <below_periods> <below_duration> <below_thresh> : newfile
-  // We use restart instead of newfile and accumulate between silence boundaries ourselves.
   const proc = spawn("sox", [
     "-d",
     "-t", "raw",
@@ -57,18 +56,10 @@ export function startVadRecording(opts: {
     "-b", "16",
     "-e", "signed-integer",
     "-",
-    "silence", "1", "0.2", "3%", "1", "1.5", "3%", ":", "restart",
   ]);
 
-  const chunks: Buffer[] = [];
-
   proc.stdout.on("data", (chunk: Buffer) => {
-    chunks.push(chunk);
-    // sox's restart effect restarts silently; we can't detect utterance boundaries
-    // purely from stdout here. Accumulate all PCM and emit periodically on silence.
-    // For a cleaner boundary, callers using VAD should treat the full buffer as one
-    // long utterance that they split on speech.end triggers from the server.
-    opts.onUtterance(Buffer.concat([chunk]));
+    opts.onUtterance(chunk);
   });
 
   proc.stderr.on("data", () => {});
