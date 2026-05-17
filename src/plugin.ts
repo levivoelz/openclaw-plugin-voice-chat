@@ -149,7 +149,10 @@ export default defineChannelPluginEntry({
 
     apiAny.registerHttpRoute({
       path: VOICE_WS_PATH,
-      auth: "gateway",
+      // TEMPORARILY plugin-auth (open) for end-to-end channel verification.
+      // Revert to "gateway" once we've added a device-token handshake on the
+      // client side (CLI + UI panel).
+      auth: "plugin",
       handler: (_req, res) => {
         res.writeHead(426, "Upgrade Required").end();
       },
