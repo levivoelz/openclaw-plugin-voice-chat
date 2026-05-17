@@ -93,7 +93,7 @@ declare module "openclaw/plugin-sdk/runtime-store" {
   }): PluginRuntimeStore<T>;
 }
 
-declare module "openclaw/plugin-sdk/channel-core" {
+declare module "openclaw/plugin-sdk/core" {
   export interface ChannelMeta {
     id: string;
     [key: string]: unknown;

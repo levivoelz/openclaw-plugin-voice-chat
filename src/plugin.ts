@@ -17,11 +17,14 @@
  * fires only once with the complete reply, defeating sentence-level TTS.
  */
 
+// `core` is where the host actually exports these — `channel-core` only
+// re-exports a subset (defineChannelPluginEntry, createChatChannelPlugin)
+// and does NOT include getChatChannelMeta or createPluginRuntimeStore.
 import {
   defineChannelPluginEntry,
   createChatChannelPlugin,
   getChatChannelMeta,
-} from "openclaw/plugin-sdk/channel-core";
+} from "openclaw/plugin-sdk/core";
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { ProviderRegistry } from "./providers/registry.js";
