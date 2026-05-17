@@ -65,6 +65,11 @@ export class VoiceSession {
   private closed = false;
   private ttsSeqByTurn = new Map<string, number>();
   private pendingTurn: Promise<void> | null = null;
+  // True only while we're actively producing TTS audio for a turn. Distinct
+  // from `ttsAbort` (which is set the moment a turn dispatches, before any
+  // audio exists) — gates barge-in so a phantom `speech.start` during the
+  // "thinking" window doesn't destroy the in-flight reply buffer.
+  private ttsActive = false;
 
   constructor(deps: VoiceSessionDeps) {
     this.ws = deps.ws;
@@ -135,7 +140,11 @@ export class VoiceSession {
   handleFrame(frame: ClientFrame): void {
     switch (frame.type) {
       case "speech.start":
-        if (this.d.config.interrupt) this.interruptTts();
+        // Only barge in if TTS is actually producing audio. Without this guard,
+        // a `speech.start` during the agent's "thinking" window (between
+        // transcript.final and tts.start) destroys the in-flight reply buffer
+        // and the user never hears the response.
+        if (this.d.config.interrupt && this.ttsActive) this.interruptTts();
         break;
       case "speech.end":
         void this.stt?.endUtterance();
@@ -304,6 +313,7 @@ export class VoiceSession {
   ): Promise<void> {
     const shortId = turnId.slice(0, 8);
     const t0 = Date.now();
+    this.ttsActive = true;
     try {
       const fmt: AudioFormat = this.d.config.tts.format;
       this.d.logger.info(`voice-chat: tts.start turn=${shortId} chars=${text.length} voice=${this.d.config.tts.voice ?? "?"}`);
@@ -333,6 +343,8 @@ export class VoiceSession {
       const err = e as Error;
       this.d.logger.error(`voice-chat: TTS error turn=${shortId}: ${err.message}`);
       this.sendError("PROVIDER_UNAVAILABLE", `TTS error: ${err.message}`, true);
+    } finally {
+      this.ttsActive = false;
     }
   }
 
@@ -343,6 +355,7 @@ export class VoiceSession {
     }
     this.sentenceBuf?.close();
     this.sentenceBuf = null;
+    this.ttsActive = false;
   }
 
   private send(frame: ServerFrame): void {

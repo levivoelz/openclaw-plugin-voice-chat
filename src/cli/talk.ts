@@ -20,9 +20,9 @@ export type TalkOptions = {
   gateway:     string;
   agentId?:    string;
   session?:    string;
-  /** Force a fresh, non-persisted clientId (one-off session). */
-  newSession?: boolean;
-  /** Use a specific clientId (peer.id for routing). Overrides default + --new. */
+  /** Resume the last voice session for this agent (use stored clientId). */
+  resume?:     boolean;
+  /** Use a specific clientId (peer.id for routing). Overrides resume. */
   clientId?:   string;
   mode:        CaptureMode;
   stt?:        string;
@@ -61,6 +61,13 @@ export async function talk(opts: TalkOptions): Promise<void> {
   // TTS audio accumulator per turn.
   const ttsBuffers = new Map<string, Buffer[]>();
   let activePlayer: AbortController | null = null;
+  // Set by startVadMode; lets startPlayback gate the mic during TTS so the
+  // speaker→mic loop doesn't trigger phantom turns. Null in PTT/text mode.
+  let vadRecorder: { stop: () => void; setMuted: (m: boolean) => void } | null = null;
+  // Speaker tail: how long the audio output keeps ringing after the player
+  // exits. We keep the mic muted for this long post-playback so the decay
+  // doesn't get captured as a fresh utterance.
+  const PLAYBACK_TAIL_MS = 300;
 
   // Start an audio playback, cancelling any in-flight one.
   async function startPlayback(turnId: string): Promise<void> {
@@ -74,18 +81,26 @@ export async function talk(opts: TalkOptions): Promise<void> {
     activePlayer?.abort();
     const ac = new AbortController();
     activePlayer = ac;
+    vadRecorder?.setMuted(true);
     try {
       await play({ audio: buf, format: opts.format, signal: ac.signal });
     } catch {
       // swallow player errors in normal mode
     } finally {
       if (activePlayer === ac) activePlayer = null;
+      if (vadRecorder) {
+        const r = vadRecorder;
+        setTimeout(() => {
+          if (!activePlayer) r.setMuted(false);
+        }, PLAYBACK_TAIL_MS);
+      }
     }
   }
 
   function interruptPlayback(): void {
     activePlayer?.abort();
     activePlayer = null;
+    vadRecorder?.setMuted(false);
     sendFrame(ws, { type: "interrupt" });
   }
 
@@ -174,11 +189,11 @@ export async function talk(opts: TalkOptions): Promise<void> {
     },
   });
 
-  // Resolve a stable clientId for routing — same client = same chat session.
+  // Resolve clientId — fresh by default, or reuse last one via `resume`.
   const clientId = resolveClientId({
     agentId: opts.agentId ?? "default",
     explicit: opts.clientId,
-    fresh: opts.newSession,
+    resume: opts.resume,
   });
   if (opts.debug || opts.print) {
     process.stderr.write(`${ANSI_DIM}[session] clientId=${clientId}${ANSI_RESET}\n`);
@@ -275,6 +290,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
       },
       onError: (e) => process.stderr.write(`Mic error: ${e.message}\n`),
     });
+    vadRecorder = recorder;
 
     process.stdin.on("keypress", (_str, key: { name?: string; ctrl?: boolean }) => {
       if (!key) return;

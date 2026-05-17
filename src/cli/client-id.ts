@@ -1,47 +1,66 @@
 /**
- * Stable per-machine + per-agent clientId so the same voice CLI run keeps
- * landing in the same chat session day-after-day. The plugin uses clientId
- * as the routing peer.id; same peer = same session.
+ * Per-invocation clientId. The plugin uses clientId as the routing peer.id;
+ * same peer = same chat session.
  *
- * Layout: ~/.config/openclaw-voice/clientId-<agent>.txt (one file per agent)
+ * Default behavior: every CLI invocation gets a fresh random clientId (a new
+ * session). The chosen id is written to `last-<agent>.txt` so a subsequent
+ * `resume` invocation can pick up the same conversation.
+ *
+ * Layout: ~/.config/openclaw-voice/last-<agent>.txt
  *
  * Override paths:
  *   --client-id <id>   exact id, no read/write
- *   --new              one-off random id, not persisted
- *   default            read existing or create + persist a new one for this agent
+ *   resume             reuse last-<agent>.txt (errors if none)
+ *   default            random uuid, persisted as "last"
  */
 
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 export type ResolveOpts = {
   agentId: string;
+  /** Explicit override — takes precedence over everything. */
   explicit?: string;
-  fresh?: boolean;
+  /** Resume the last clientId used for this agent. Throws if none stored. */
+  resume?: boolean;
 };
 
 export function resolveClientId(opts: ResolveOpts): string {
-  if (opts.explicit && opts.explicit.length > 0) return opts.explicit;
-  if (opts.fresh) return randomUUID();
-
-  const dir = join(homedir(), ".config", "openclaw-voice");
-  const safeAgent = opts.agentId.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
-  const file = join(dir, `clientId-${safeAgent}.txt`);
-
-  if (existsSync(file)) {
-    const id = readFileSync(file, "utf8").trim();
-    if (id.length > 0) return id;
+  if (opts.explicit && opts.explicit.length > 0) {
+    saveLast(opts.agentId, opts.explicit);
+    return opts.explicit;
   }
-
-  const id = `${hostname().split(".")[0]}-${safeAgent}-${randomUUID().slice(0, 8)}`;
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(file, id + "\n", { mode: 0o600 });
-  return id;
+  if (opts.resume) {
+    const prev = loadLast(opts.agentId);
+    if (!prev) {
+      throw new Error(
+        `No previous voice session found for agent "${opts.agentId}". ` +
+          `Start a new session first (without 'resume').`,
+      );
+    }
+    return prev;
+  }
+  const fresh = randomUUID();
+  saveLast(opts.agentId, fresh);
+  return fresh;
 }
 
-export function clientIdStorePath(agentId: string): string {
+export function loadLast(agentId: string): string | null {
+  const file = lastFile(agentId);
+  if (!existsSync(file)) return null;
+  const id = readFileSync(file, "utf8").trim();
+  return id.length > 0 ? id : null;
+}
+
+function saveLast(agentId: string, id: string): void {
+  const file = lastFile(agentId);
+  mkdirSync(join(file, ".."), { recursive: true });
+  writeFileSync(file, id + "\n", { mode: 0o600 });
+}
+
+function lastFile(agentId: string): string {
   const safe = agentId.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
-  return join(homedir(), ".config", "openclaw-voice", `clientId-${safe}.txt`);
+  return join(homedir(), ".config", "openclaw-voice", `last-${safe}.txt`);
 }

@@ -16,13 +16,19 @@ export type VadOptions = {
   speechOnsetMs?: number;
   /** Ms of below-threshold audio before SPEECH state ends. Default 800. */
   speechOffsetMs?: number;
-  /** Drop utterances shorter than this. Whisper hallucinates badly on
+  /** Drop utterances shorter than this. STT models hallucinate badly on
    *  sub-speech clips; 600 ms ≈ a single short word minimum. Default 600. */
   minUtteranceMs?: number;
   /** Max utterance length — force-end after this. Default 30s. */
   maxUtteranceMs?: number;
   /** Ms of pre-roll audio to prepend (captures the word that triggered onset). Default 200. */
   preRollMs?: number;
+  /** Required peak RMS within the utterance to actually emit. STT models
+   *  (whisper, parakeet) confabulate plausible English on near-silent audio;
+   *  real speech peaks at ~0.1–0.3 RMS while room tone hovers near `threshold`.
+   *  Setting this well above `threshold` filters utterances that triggered on
+   *  a transient (a click, breath, HVAC) but were otherwise silence. Default 0.08. */
+  minPeakRms?: number;
 };
 
 const DEFAULTS: Required<VadOptions> = {
@@ -33,6 +39,7 @@ const DEFAULTS: Required<VadOptions> = {
   minUtteranceMs: 600,
   maxUtteranceMs: 30_000,
   preRollMs: 200,
+  minPeakRms: 0.08,
 };
 
 type State = "idle" | "speech";
@@ -48,6 +55,8 @@ export class Vad {
   private utteranceBytes = 0;  // bytes collected in current SPEECH
   private chunks: Buffer[] = [];
   private preRoll: Buffer[] = [];
+  private peakRms = 0;         // max RMS observed during current SPEECH
+  private muted = false;
 
   constructor(onUtterance: (pcm: Buffer) => void, options: VadOptions) {
     this.opts = { ...DEFAULTS, ...options };
@@ -55,7 +64,18 @@ export class Vad {
     this.onUtterance = onUtterance;
   }
 
+  /**
+   * Half-duplex gate. When muted, incoming audio is dropped and any in-flight
+   * state is reset without emitting. Used to suppress mic ingest during local
+   * TTS playback so the speaker→mic echo loop doesn't trigger a phantom turn.
+   */
+  setMuted(muted: boolean): void {
+    if (muted && !this.muted) this.reset();
+    this.muted = muted;
+  }
+
   push(pcm: Buffer): void {
+    if (this.muted) return;
     const rms = computeRms(pcm);
     const isSpeech = rms >= this.opts.threshold;
     const bytes = pcm.byteLength;
@@ -84,6 +104,7 @@ export class Vad {
     // SPEECH state — append audio and track silence streak.
     this.chunks.push(pcm);
     this.utteranceBytes += bytes;
+    if (rms > this.peakRms) this.peakRms = rms;
 
     if (isSpeech) {
       this.belowStreak = 0;
@@ -103,16 +124,24 @@ export class Vad {
   flush(): void {
     if (this.state === "speech" && this.chunks.length > 0) {
       const utteranceMs = this.utteranceBytes / this.bytesPerMs;
-      if (utteranceMs >= this.opts.minUtteranceMs) {
+      // Two gates: minimum duration AND peak energy. The peak gate prevents
+      // STT from being fed near-silent audio (room tone clearing `threshold`
+      // for the onset window then mostly quiet), which causes confabulation.
+      if (utteranceMs >= this.opts.minUtteranceMs && this.peakRms >= this.opts.minPeakRms) {
         this.onUtterance(Buffer.concat(this.chunks));
       }
     }
+    this.reset();
+  }
+
+  private reset(): void {
     this.state = "idle";
     this.aboveStreak = 0;
     this.belowStreak = 0;
     this.utteranceBytes = 0;
     this.chunks = [];
     this.preRoll = [];
+    this.peakRms = 0;
   }
 
   private trimPreRoll(): void {

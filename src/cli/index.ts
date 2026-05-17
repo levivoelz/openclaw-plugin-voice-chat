@@ -16,16 +16,18 @@ const pkg = (await import("../../package.json", { with: { type: "json" } })).def
 const version = pkg.version;
 
 const HELP = `
-openclaw-voice [options]
+openclaw-voice [resume] [options]
+
+Sessions:
+  Every invocation starts a NEW chat session by default. Use \`resume\` to
+  continue the most recent session for the given agent.
 
 Options:
   --gateway <url>         WS gateway URL (default: ws://127.0.0.1:18790)
                           or \$OPENCLAW_GATEWAY
   --agent <id>            Target agent id (default: gateway default)
-  --session <key>         Resume an existing chat session by sessionKey
-  --client-id <id>        Use this exact peer id (bypasses --new and the
-                          per-agent persisted default)
-  --new                   Fresh, non-persisted clientId — one-off session
+  --session <key>         Force a specific sessionKey (advanced)
+  --client-id <id>        Force a specific peer id (overrides resume)
   --mode <ptt|vad>        Capture mode (default: ptt)
   --stt <provider>        STT provider id (e.g. voice-chat/openai-realtime)
   --stt-model <name>      STT model name
@@ -42,6 +44,7 @@ Options:
   --version, -v           Show version
 
 Subcommands:
+  resume                  Resume the last voice session for --agent
   doctor                  Check sox, mic, player, gateway reachability
   sessions                List chat sessions via gateway API
   pair                    Device pairing (stub)
@@ -88,6 +91,7 @@ async function main(): Promise<void> {
   const debug = hasFlag(argv, "--debug");
 
   const subcommand = argv[0];
+  const resume = subcommand === "resume";
 
   if (subcommand === "doctor") {
     await doctor({ gateway, deviceToken, debug });
@@ -123,7 +127,7 @@ async function main(): Promise<void> {
     agentId:     arg(argv, "--agent"),
     session:     arg(argv, "--session"),
     clientId:    arg(argv, "--client-id"),
-    newSession:  hasFlag(argv, "--new"),
+    resume,
     mode:        rawMode as CaptureMode,
     stt:         arg(argv, "--stt"),
     sttModel:    arg(argv, "--stt-model"),
