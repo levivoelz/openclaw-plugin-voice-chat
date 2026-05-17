@@ -16,7 +16,8 @@ export type VadOptions = {
   speechOnsetMs?: number;
   /** Ms of below-threshold audio before SPEECH state ends. Default 800. */
   speechOffsetMs?: number;
-  /** Drop utterances shorter than this (likely a cough/clack). Default 200. */
+  /** Drop utterances shorter than this. Whisper hallucinates badly on
+   *  sub-speech clips; 600 ms ≈ a single short word minimum. Default 600. */
   minUtteranceMs?: number;
   /** Max utterance length — force-end after this. Default 30s. */
   maxUtteranceMs?: number;
@@ -29,7 +30,7 @@ const DEFAULTS: Required<VadOptions> = {
   threshold: 0.03,
   speechOnsetMs: 150,
   speechOffsetMs: 800,
-  minUtteranceMs: 200,
+  minUtteranceMs: 600,
   maxUtteranceMs: 30_000,
   preRollMs: 200,
 };

@@ -1,6 +1,7 @@
 import type { ProviderRegistry } from "../registry.js";
 import type { SttCreateOptions, SttSession } from "./types.js";
 import { resolveDaemonAuth, isDaemonConfigured, daemonPost } from "../daemon.js";
+import { isWhisperHallucination } from "./hallucinations.js";
 
 /**
  * Chunked Whisper STT via the iris-secrets daemon.
@@ -55,7 +56,15 @@ function createSession(opts: SttCreateOptions): SttSession {
           // language fillers because they're acoustically ambiguous.
           prompt: "Conversational English voice chat with Iris, an AI assistant.",
         }, { timeoutMs: 60_000 });
-        if (res.text && callbacks.onFinal) callbacks.onFinal(res.text);
+        if (res.text && callbacks.onFinal) {
+          if (isWhisperHallucination(res.text)) {
+            // Silent drop — well-known whisper artifact from sub-speech audio.
+            // No turn fires; no log noise (caller already logged that audio
+            // was sent; the absence of transcript.final is the diagnostic).
+            return;
+          }
+          callbacks.onFinal(res.text);
+        }
       } catch (e) {
         callbacks.onError?.(e instanceof Error ? e : new Error(String(e)));
       }
