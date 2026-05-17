@@ -79,14 +79,7 @@ declare module "openclaw/plugin-sdk/core" {
  * declare here — we expose only the helpers we actually call. Everything is
  * intentionally loose; the host enforces the contract at runtime.
  */
-declare module "openclaw/plugin-sdk/channel-core" {
-  export interface ChannelMeta {
-    id: string;
-    [key: string]: unknown;
-  }
-
-  export function getChatChannelMeta(id: string): ChannelMeta;
-
+declare module "openclaw/plugin-sdk/runtime-store" {
   export interface PluginRuntimeStore<T> {
     setRuntime: (next: T) => void;
     clearRuntime: () => void;
@@ -98,6 +91,15 @@ declare module "openclaw/plugin-sdk/channel-core" {
     pluginId: string;
     errorMessage: string;
   }): PluginRuntimeStore<T>;
+}
+
+declare module "openclaw/plugin-sdk/channel-core" {
+  export interface ChannelMeta {
+    id: string;
+    [key: string]: unknown;
+  }
+
+  export function getChatChannelMeta(id: string): ChannelMeta;
 
   /**
    * The ChannelPlugin shape is large and version-shifting; we keep it `any`

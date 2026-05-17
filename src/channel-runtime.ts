@@ -6,7 +6,7 @@
  * real contract. Loose typing here is intentional.
  */
 
-import { createPluginRuntimeStore } from "openclaw/plugin-sdk/channel-core";
+import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 
 export type VoiceChatRuntime = unknown;
 
