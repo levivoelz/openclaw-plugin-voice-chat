@@ -309,7 +309,9 @@ export class VoiceSession {
           this.d.logger.info(
             `voice-chat: turn.text_done turn=${shortId} e2e_ms=${e2eMs}`,
           );
-          this.turnTimings.delete(turnId);
+          // Don't delete the timing here — tts.first_byte and turn.audio_start
+          // fire AFTER agent.done (TTS is async, the first synth call is still
+          // streaming when the LLM finishes). Cleanup happens in close().
         }
       }
     } catch (e) {
