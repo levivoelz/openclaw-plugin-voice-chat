@@ -229,6 +229,10 @@ export class VoiceSession {
       channel: CHANNEL_ID,
       accountId: this.d.accountId,
       peer: { kind: "direct", id: this.d.clientId },
+      // Default is "main" — which collapses every peer into the agent's
+      // primary thread. We want one thread per (channel, peer) so voice
+      // stays separate from text/main and per-client voice stays separate.
+      dmScope: "per-channel-peer",
     });
     this.d.logger.info(`voice-chat: agent.dispatch turn=${turnId.slice(0, 8)} sessionKey=${sessionKey}`);
 
@@ -381,6 +385,7 @@ type RuntimeShape = {
         channel: string;
         accountId: string;
         peer: { kind: string; id: string };
+        dmScope?: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer";
       }) => string;
     };
     reply: {

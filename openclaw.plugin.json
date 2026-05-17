@@ -82,7 +82,7 @@
             "properties": {
               "provider": { "type": "string", "default": "voice-chat/openai-whisper" },
               "model":    { "type": "string", "default": "gpt-4o-mini-transcribe" },
-              "language": { "type": "string" }
+              "language": { "type": "string", "default": "en" }
             }
           },
           "tts": {
