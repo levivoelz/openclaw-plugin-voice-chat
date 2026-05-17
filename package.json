@@ -20,6 +20,8 @@
   },
   "files": [
     "dist",
+    "src",
+    "types",
     "openclaw.plugin.json",
     "ui",
     "README.md",
@@ -32,7 +34,7 @@
     "clean": "rm -rf dist"
   },
   "openclaw": {
-    "extensions": ["./dist/plugin.js"],
+    "extensions": ["./src/plugin.ts"],
     "compat": {
       "minGatewayVersion": "2026.5.12"
     }
