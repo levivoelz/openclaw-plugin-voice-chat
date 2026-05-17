@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AudioFormat } from "../types.js";
+import { Vad } from "./vad.js";
 
 const WAV_HEADER_SIZE = 44;
 
@@ -39,15 +40,17 @@ export function startRecording(opts: {
 }
 
 /**
- * VAD recording: continuous mic capture, no client-side silence detection.
- * Server-side VAD (OpenAI Realtime turn_detection) handles utterance
- * boundaries. We just stream PCM out as fast as sox produces it.
+ * VAD recording: continuous mic capture, client-side amplitude VAD.
+ * Sox streams raw PCM; we feed each chunk into the Vad state machine which
+ * emits complete utterance buffers on silence boundaries.
  */
 export function startVadRecording(opts: {
   sampleRate: number;
   onUtterance: (pcm: Buffer) => void;
   onError: (e: Error) => void;
 }): { stop: () => void } {
+  const vad = new Vad(opts.onUtterance, { sampleRate: opts.sampleRate });
+
   const proc = spawn("sox", [
     "-d",
     "-t", "raw",
@@ -59,7 +62,7 @@ export function startVadRecording(opts: {
   ]);
 
   proc.stdout.on("data", (chunk: Buffer) => {
-    opts.onUtterance(chunk);
+    vad.push(chunk);
   });
 
   proc.stderr.on("data", () => {});

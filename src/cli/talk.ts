@@ -252,22 +252,26 @@ export async function talk(opts: TalkOptions): Promise<void> {
   }
 
   // ---- VAD mode ----
-  // Server-side VAD via OpenAI Realtime STT segments utterances. We stream
-  // audio continuously and let the STT provider emit transcripts on silence
-  // boundaries. ONE speech.start at session begin; never a per-chunk
-  // speech.end (which would force-commit fragments).
+  // Client-side amplitude VAD: sox streams continuous PCM, the Vad state
+  // machine emits one complete utterance per silence boundary. Each emitted
+  // utterance becomes one {speech.start, audio, speech.end} burst.
   function startVadMode(): void {
     const { startVadRecording } = audioMod;
-    process.stderr.write('VAD mode active (server-side VAD). ESC or Ctrl-C to exit.\n');
+    process.stderr.write('VAD mode active (local). Speak naturally — utterances send on pause. ESC or Ctrl-C to exit.\n');
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
-
-    sendFrame(ws, { type: "speech.start" });
 
     const recorder = startVadRecording({
       sampleRate: 24000,
       onUtterance: (pcm) => {
-        ws.send(pcm, { binary: true });
+        if (opts.print) process.stderr.write(`${ANSI_DIM}[vad] utterance ${pcm.byteLength} bytes${ANSI_RESET}\n`);
+        sendFrame(ws, { type: "speech.start" });
+        // Chunk into 16KB frames so the server can pipeline.
+        const CHUNK = 16 * 1024;
+        for (let i = 0; i < pcm.byteLength; i += CHUNK) {
+          ws.send(pcm.subarray(i, Math.min(i + CHUNK, pcm.byteLength)), { binary: true });
+        }
+        sendFrame(ws, { type: "speech.end" });
       },
       onError: (e) => process.stderr.write(`Mic error: ${e.message}\n`),
     });
@@ -277,7 +281,6 @@ export async function talk(opts: TalkOptions): Promise<void> {
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
         interruptPlayback();
         recorder.stop();
-        sendFrame(ws, { type: "speech.end" });
         sendFrame(ws, { type: "bye" });
         ws.close();
         process.exit(0);

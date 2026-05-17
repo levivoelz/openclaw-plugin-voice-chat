@@ -17,7 +17,7 @@ export type PluginConfigShape = {
 };
 
 const DEFAULTS = {
-  stt: { provider: "voice-chat/openai-realtime", model: "gpt-4o-transcribe" },
+  stt: { provider: "voice-chat/openai-whisper", model: "gpt-4o-mini-transcribe" },
   tts: { provider: "voice-chat/openai", model: "tts-1", voice: "shimmer", format: "mp3" as AudioFormat },
   interrupt: true,
   mode: "ptt" as CaptureMode,
