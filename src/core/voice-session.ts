@@ -127,6 +127,9 @@ export class VoiceSession {
       ttsProvider: ttsProv.id,
       ttsFormat: this.d.config.tts.format,
     });
+    this.d.logger.info(
+      `voice-chat: session ready agent=${this.d.agentId} client=${this.d.clientId} stt=${sttProv.id} tts=${ttsProv.id}/${this.d.config.tts.voice ?? "?"}`,
+    );
   }
 
   handleFrame(frame: ClientFrame): void {
@@ -166,6 +169,7 @@ export class VoiceSession {
    * over-long block gets split.
    */
   deliverAgentText(text: string, turnId: string): void {
+    this.d.logger.info(`voice-chat: agent.delta turn=${turnId.slice(0, 8)} chars=${text.length} "${preview(text)}"`);
     this.send({ type: "agent.delta", text, turnId });
     this.sentenceBuf?.push(text);
   }
@@ -176,8 +180,10 @@ export class VoiceSession {
     if (!trimmed) return;
 
     const turnId = randomUUID();
+    const shortId = turnId.slice(0, 8);
     this.currentTurnId = turnId;
     this.ttsSeqByTurn.set(turnId, 0);
+    this.d.logger.info(`voice-chat: transcript.final turn=${shortId} "${preview(trimmed)}"`);
     this.send({ type: "transcript.final", text: trimmed, turnId });
 
     const ttsProv = this.d.registry.getTts(this.d.config.tts.provider)!;
@@ -188,14 +194,16 @@ export class VoiceSession {
       void this.speak(chunk, turnId, ttsProv, ttsAbort.signal);
     });
 
+    const t0 = Date.now();
     try {
       this.pendingTurn = this.runChannelTurn(trimmed, turnId);
       await this.pendingTurn;
       this.sentenceBuf?.flush();
+      this.d.logger.info(`voice-chat: agent.done turn=${shortId} duration=${Date.now() - t0}ms`);
       this.send({ type: "agent.done", turnId });
     } catch (e) {
       const err = e as Error;
-      this.d.logger.error(`voice-chat: agent turn failed: ${err.message}`);
+      this.d.logger.error(`voice-chat: agent turn failed turn=${shortId}: ${err.message}`);
       this.sendError("AGENT_ERROR", err.message, true);
     } finally {
       this.pendingTurn = null;
@@ -222,6 +230,7 @@ export class VoiceSession {
       accountId: this.d.accountId,
       peer: { kind: "direct", id: this.d.clientId },
     });
+    this.d.logger.info(`voice-chat: agent.dispatch turn=${turnId.slice(0, 8)} sessionKey=${sessionKey}`);
 
     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
       Body: transcript,
@@ -289,8 +298,11 @@ export class VoiceSession {
     ttsProv: ReturnType<ProviderRegistry["getTts"]> extends infer P ? NonNullable<P> : never,
     signal: AbortSignal,
   ): Promise<void> {
+    const shortId = turnId.slice(0, 8);
+    const t0 = Date.now();
     try {
       const fmt: AudioFormat = this.d.config.tts.format;
+      this.d.logger.info(`voice-chat: tts.start turn=${shortId} chars=${text.length} voice=${this.d.config.tts.voice ?? "?"}`);
       const stream = ttsProv.synthesize({
         text,
         model: this.d.config.tts.model,
@@ -299,20 +311,23 @@ export class VoiceSession {
         providerConfig: this.d.pluginConfig,
         signal,
       });
+      let totalBytes = 0;
       for await (const { chunk } of stream) {
         if (signal.aborted || this.closed) return;
         const seq = (this.ttsSeqByTurn.get(turnId) ?? 0) + 1;
         this.ttsSeqByTurn.set(turnId, seq);
+        totalBytes += chunk.byteLength;
         this.send({ type: "tts.chunk", turnId, seq, format: fmt });
         this.ws.send(chunk, { binary: true });
       }
       if (!signal.aborted && !this.closed) {
         this.send({ type: "tts.done", turnId });
+        this.d.logger.info(`voice-chat: tts.done turn=${shortId} bytes=${totalBytes} duration=${Date.now() - t0}ms`);
       }
     } catch (e) {
       if (signal.aborted) return;
       const err = e as Error;
-      this.d.logger.error(`voice-chat: TTS error: ${err.message}`);
+      this.d.logger.error(`voice-chat: TTS error turn=${shortId}: ${err.message}`);
       this.sendError("PROVIDER_UNAVAILABLE", `TTS error: ${err.message}`, true);
     }
   }
@@ -338,6 +353,7 @@ export class VoiceSession {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.d.logger.info(`voice-chat: session closed client=${this.d.clientId}`);
     this.interruptTts();
     void this.stt?.close();
     this.stt = null;
@@ -345,6 +361,11 @@ export class VoiceSession {
       this.ws.close();
     }
   }
+}
+
+function preview(s: string, max = 80): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length <= max ? t : t.slice(0, max - 1) + "…";
 }
 
 /**
