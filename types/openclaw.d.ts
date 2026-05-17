@@ -140,3 +140,9 @@ declare module "openclaw/plugin-sdk/core" {
     opts: DefineChannelPluginEntryOpts<TRuntime>,
   ): DefinedChannelPluginEntry<TRuntime>;
 }
+
+declare module "openclaw/plugin-sdk/channel-reply-core" {
+  /** Loose pass-through — host validates the param shape at runtime. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  export function createChannelReplyPipeline(params: any): any;
+}
