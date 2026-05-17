@@ -81,7 +81,7 @@
             "additionalProperties": false,
             "properties": {
               "provider": { "type": "string", "default": "voice-chat/openai-whisper" },
-              "model":    { "type": "string", "default": "gpt-4o-mini-transcribe" },
+              "model":    { "type": "string", "default": "whisper-1" },
               "language": { "type": "string", "default": "en" }
             }
           },

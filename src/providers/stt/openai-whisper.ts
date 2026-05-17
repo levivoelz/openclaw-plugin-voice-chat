@@ -50,6 +50,10 @@ function createSession(opts: SttCreateOptions): SttSession {
           format: "wav",
           model,
           ...(language ? { language } : {}),
+          // Strong bias toward English short utterances. Without this hint
+          // whisper sometimes misclassifies "uh" / "yeah" / "ok" as Asian
+          // language fillers because they're acoustically ambiguous.
+          prompt: "Conversational English voice chat with Iris, an AI assistant.",
         }, { timeoutMs: 60_000 });
         if (res.text && callbacks.onFinal) callbacks.onFinal(res.text);
       } catch (e) {
