@@ -18,7 +18,8 @@ import type { ProviderRegistry } from "../providers/registry.js";
 import type { SttSession } from "../providers/stt/types.js";
 import type { AgentBridge } from "./agent-bridge.js";
 
-const SAMPLE_RATE = 16_000;
+// 24 kHz: minimum accepted by OpenAI Realtime, also fine for Whisper.
+const SAMPLE_RATE = 24_000;
 
 type Logger = {
   info: (m: string) => void;

@@ -12,9 +12,11 @@ function getApiKey(cfg: Record<string, unknown>): string {
 }
 
 function createRealtimeSession(opts: SttCreateOptions): SttSession {
-  const { model = "gpt-4o-transcribe", providerConfig, callbacks, sampleRate: _sampleRate } = opts;
+  const { model = "gpt-4o-transcribe", language, providerConfig, callbacks, sampleRate } = opts;
   const apiKey = getApiKey(providerConfig);
-  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+  // GA transcription-only endpoint. Session is configured below with a
+  // `transcription`-type payload. No beta header — that API is retired.
+  const url = `wss://api.openai.com/v1/realtime?intent=transcription`;
 
   let ws: WebSocket | null = null;
   let connected = false;
@@ -31,18 +33,32 @@ function createRealtimeSession(opts: SttCreateOptions): SttSession {
         ws = new WebSocket(url, {
           headers: {
             Authorization: `Bearer ${apiKey}`,
-            "OpenAI-Beta": "realtime=v1",
           },
         });
 
         ws.on("open", () => {
           connected = true;
-          // Configure the session for input audio transcription only.
           send({
             type: "session.update",
             session: {
-              input_audio_format: "pcm16",
-              input_audio_transcription: { model },
+              type: "transcription",
+              audio: {
+                input: {
+                  format: { type: "audio/pcm", rate: sampleRate },
+                  transcription: {
+                    model,
+                    ...(language ? { language } : {}),
+                  },
+                  // Server VAD so utterances finalize on trailing silence.
+                  // We also support manual finalization via endUtterance().
+                  turn_detection: {
+                    type: "server_vad",
+                    threshold: 0.5,
+                    prefix_padding_ms: 300,
+                    silence_duration_ms: 500,
+                  },
+                },
+              },
             },
           });
           resolve();
