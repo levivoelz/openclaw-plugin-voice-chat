@@ -14,7 +14,7 @@ export type VadOptions = {
   threshold?: number;
   /** Ms of above-threshold audio before SPEECH state begins. Default 150. */
   speechOnsetMs?: number;
-  /** Ms of below-threshold audio before SPEECH state ends. Default 400. */
+  /** Ms of below-threshold audio before SPEECH state ends. Default 250. */
   speechOffsetMs?: number;
   /** Drop utterances shorter than this. STT models hallucinate badly on
    *  sub-speech clips; 600 ms ≈ a single short word minimum. Default 600. */
@@ -38,7 +38,10 @@ const DEFAULTS: Required<VadOptions> = {
   sampleRate: 24000,
   threshold: 0.03,
   speechOnsetMs: 150,
-  speechOffsetMs: 800,
+  // 250ms is the LiveKit/Pipecat default for natural turn-taking; below
+  // that you start cutting users off mid-pause. Above 400 the perceived
+  // latency dominates the conversation feel.
+  speechOffsetMs: 250,
   minUtteranceMs: 600,
   maxUtteranceMs: 30_000,
   preRollMs: 200,
