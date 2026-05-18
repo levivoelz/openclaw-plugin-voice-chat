@@ -36,16 +36,24 @@ const VAD_TRACE = process.env["VOICE_CHAT_DEBUG"] === "vad";
 
 const DEFAULTS: Required<VadOptions> = {
   sampleRate: 24000,
-  threshold: 0.03,
+  // Lowered from 0.03 to admit quieter speech (laptop mics across rooms,
+  // soft-spoken users). We rely on parakeet's per-token confidence
+  // (minConfidence=0.85 default in the STT provider) as the hallucination
+  // backstop — the model knows when it's guessing on ambient noise.
+  threshold: 0.015,
   speechOnsetMs: 150,
   // 250ms is the LiveKit/Pipecat default for natural turn-taking; below
   // that you start cutting users off mid-pause. Above 400 the perceived
   // latency dominates the conversation feel.
   speechOffsetMs: 250,
-  minUtteranceMs: 600,
+  // Allow shorter utterances ("yeah", "no", "stop") through. Sub-400ms
+  // is too short for sustained speech — that's the floor.
+  minUtteranceMs: 400,
   maxUtteranceMs: 30_000,
   preRollMs: 200,
-  minPeakRms: 0.08,
+  // Lowered from 0.08 to match the lower entry threshold. The confidence
+  // filter downstream catches the hallucinations this previously stopped.
+  minPeakRms: 0.04,
 };
 
 type State = "idle" | "speech";
