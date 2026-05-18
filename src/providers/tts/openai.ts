@@ -1,14 +1,13 @@
 import type { ProviderRegistry } from "../registry.js";
 import type { AudioFormat } from "../../types.js";
 import type { TtsProviderDescriptor, TtsSynthesizeRequest, TtsStreamChunk, TtsVoice } from "./types.js";
-import { resolveDaemonAuth, isDaemonConfigured, daemonPost } from "../daemon.js";
+import { resolveDaemonAuth, isDaemonConfigured, daemonStream } from "../daemon.js";
 
 /**
- * OpenAI TTS via the iris-secrets daemon. The daemon's /openai/speech
- * endpoint returns the entire audio buffer base64-encoded in JSON, so we
- * lose true streaming — but for typical reply lengths the synthesis is
- * sub-second, and we recover incremental playback by sentence-chunking at
- * the orchestrator layer (one daemon call per sentence).
+ * OpenAI TTS via the iris-secrets daemon. Uses the daemon's
+ * /openai/speech-stream endpoint which proxies OpenAI TTS with HTTP chunked
+ * transfer encoding. Yields Uint8Array chunks as they arrive, buffering small
+ * chunks into at least 4 KB before yielding to reduce WS overhead.
  */
 
 const OPENAI_VOICES = [
@@ -22,11 +21,13 @@ function mapFormat(fmt: AudioFormat): string {
   return fmt;
 }
 
+const MIN_YIELD_BYTES = 4096; // don't yield chunks smaller than 4 KB (reduces WS overhead)
+
 async function* synthesize(req: TtsSynthesizeRequest): AsyncIterable<TtsStreamChunk> {
   const auth = resolveDaemonAuth(req.providerConfig);
-  const res = await daemonPost<{ audio_b64: string; format: string }>(
+  const stream = daemonStream(
     auth,
-    "/openai/speech",
+    "/openai/speech-stream",
     {
       input: req.text,
       voice: req.voice ?? "alloy",
@@ -35,14 +36,44 @@ async function* synthesize(req: TtsSynthesizeRequest): AsyncIterable<TtsStreamCh
     },
     { timeoutMs: 120_000, signal: req.signal },
   );
-  const audio = Buffer.from(res.audio_b64, "base64");
-  yield { seq: 1, chunk: new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength) };
+
+  let seq = 0;
+  let buffer: Uint8Array[] = [];
+  let bufferedBytes = 0;
+
+  for await (const chunk of stream) {
+    buffer.push(chunk);
+    bufferedBytes += chunk.byteLength;
+    if (bufferedBytes >= MIN_YIELD_BYTES) {
+      const merged = mergeChunks(buffer, bufferedBytes);
+      buffer = [];
+      bufferedBytes = 0;
+      yield { seq: ++seq, chunk: merged };
+    }
+  }
+
+  // Flush any remaining buffered bytes
+  if (bufferedBytes > 0) {
+    const merged = mergeChunks(buffer, bufferedBytes);
+    yield { seq: ++seq, chunk: merged };
+  }
+}
+
+function mergeChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
+  if (chunks.length === 1) return chunks[0]!;
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return merged;
 }
 
 const descriptor: TtsProviderDescriptor = {
   id: "voice-chat/openai",
   label: "OpenAI TTS (via daemon)",
-  streaming: false, // see note above; daemon returns one base64 chunk
+  streaming: true,
   models: ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"],
   defaultModel: "tts-1",
   async voices(_cfg: Record<string, unknown>): Promise<TtsVoice[]> {

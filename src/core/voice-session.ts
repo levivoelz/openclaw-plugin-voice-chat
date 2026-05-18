@@ -20,6 +20,7 @@ import type {
   VoiceErrorCode,
 } from "../types.js";
 import { SentenceBuffer } from "./sentence-buffer.js";
+import { prefixMatches } from "./speculative.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { SttSession } from "../providers/stt/types.js";
 import { getVoiceChatRuntime } from "../channel-runtime.js";
@@ -34,6 +35,13 @@ const CHANNEL_ID = "voice-chat";
 
 // Debug timing — only active when VOICE_CHAT_DEBUG is set.
 const DEBUG = !!process.env["VOICE_CHAT_DEBUG"];
+
+// Speculative dispatch tuning. We pre-dispatch the LLM on a confident partial
+// transcript to hide the model's TTFT inside the user's still-talking time.
+// A rejected speculative wastes a sub-cent of tokens; a promoted one saves
+// 400–900ms of perceived latency.
+const SPECULATIVE_MIN_CHARS = 10;          // skip noise / single-word partials
+const SPECULATIVE_STABILITY_MS = 300;      // partial must be unchanged this long
 
 type TurnTiming = {
   audioStart: number;
@@ -101,6 +109,18 @@ export class VoiceSession {
   private _pendingAudioEnd: number | null = null;
   // Pending audio byte count — accumulated in handleBinary between speech.start and speech.end.
   private _pendingAudioBytes = 0;
+  // ── Speculative dispatch state ────────────────────────────────────────
+  // Set while a speculative LLM turn is in flight. If onFinal arrives and the
+  // final text starts with `speculativeText` (case-insensitive), we promote
+  // it; otherwise we abort it and dispatch a fresh turn for the real final.
+  private speculativeTurnId: string | null = null;
+  private speculativeText = "";
+  private speculativePromise: Promise<void> | null = null;
+  // Tracks partial transcript stability so we only dispatch on a partial
+  // that's been quiescent for SPECULATIVE_STABILITY_MS — i.e., the STT
+  // isn't actively revising its guess.
+  private lastPartialText = "";
+  private partialStableTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: VoiceSessionDeps) {
     this.ws = deps.ws;
@@ -137,7 +157,7 @@ export class VoiceSession {
       sampleRate: SAMPLE_RATE,
       providerConfig: this.d.pluginConfig,
       callbacks: {
-        onPartial: (text) => this.send({ type: "transcript.partial", text }),
+        onPartial: (text) => this.onPartialTranscript(text),
         onFinal:   (text) => void this.onFinalTranscript(text),
         onError:   (err)  => {
           this.d.logger.error(`voice-chat: STT error: ${err.message}`);
@@ -251,14 +271,144 @@ export class VoiceSession {
     this.sentenceBufs.get(turnId)?.push(text);
   }
 
+  /**
+   * STT delivered a (possibly revised) partial transcript. We forward it to
+   * the client UI as-is, then arm the speculative-dispatch stability timer.
+   * If the partial stays unchanged for SPECULATIVE_STABILITY_MS and is at
+   * least SPECULATIVE_MIN_CHARS, we pre-dispatch the LLM on it. The bet:
+   * the user will keep talking but the prefix won't change — by the time
+   * the real final arrives, we've already hidden most of the LLM's TTFT.
+   */
+  private onPartialTranscript(text: string): void {
+    if (this.closed) return;
+    this.send({ type: "transcript.partial", text });
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (trimmed === this.lastPartialText) return;
+    this.lastPartialText = trimmed;
+
+    // Reset the stability timer — the partial just changed.
+    if (this.partialStableTimer) clearTimeout(this.partialStableTimer);
+
+    // If a speculative dispatch is already in flight, don't start another.
+    // (The prior one will be promoted or rejected by onFinal.)
+    if (this.speculativeTurnId !== null) return;
+
+    if (trimmed.length < SPECULATIVE_MIN_CHARS) return;
+
+    const candidate = trimmed;
+    this.partialStableTimer = setTimeout(() => {
+      this.partialStableTimer = null;
+      // Re-check conditions at fire time.
+      if (this.closed) return;
+      if (this.speculativeTurnId !== null) return;
+      if (this.lastPartialText !== candidate) return;
+      this.startSpeculativeDispatch(candidate);
+    }, SPECULATIVE_STABILITY_MS);
+  }
+
+  /**
+   * Pre-dispatch the LLM on a confident partial transcript. The turn runs
+   * through the normal pipeline under a fresh `speculativeTurnId`. When the
+   * real final arrives, onFinalTranscript() either promotes or rejects it.
+   */
+  private startSpeculativeDispatch(partialText: string): void {
+    const turnId = randomUUID();
+    this.speculativeTurnId = turnId;
+    this.speculativeText = partialText;
+    if (DEBUG) {
+      this.d.logger.info(
+        `voice-chat: speculative.dispatched turn=${turnId.slice(0, 8)} chars=${partialText.length} partial="${preview(partialText)}"`,
+      );
+    }
+    this.speculativePromise = this.runDispatchForTurn(turnId, partialText)
+      .catch(() => { /* errors are logged inside runDispatchForTurn */ });
+  }
+
   private async onFinalTranscript(text: string): Promise<void> {
     if (this.closed) return;
     const trimmed = text.trim();
     if (!trimmed) return;
 
+    // Cancel any pending stability timer — we have the real final now.
+    if (this.partialStableTimer) {
+      clearTimeout(this.partialStableTimer);
+      this.partialStableTimer = null;
+    }
+    this.lastPartialText = "";
+
+    // ── Speculative dispatch decision ─────────────────────────────────────
+    // If a speculative is in flight, either promote or reject it. Prefix
+    // match is case-insensitive after collapsing internal whitespace —
+    // STT punctuation jitter (commas, periods) shouldn't reject a good
+    // guess where every word matched.
+    const speculativeTurnId = this.speculativeTurnId;
+    const speculativeText = this.speculativeText;
+    if (speculativeTurnId !== null) {
+      if (prefixMatches(speculativeText, trimmed)) {
+        // Promote: the speculative turn IS this turn. Send transcript.final
+        // bound to the speculative turn id so the client can correlate the
+        // already-streaming agent.delta frames to a user message.
+        if (DEBUG) {
+          this.d.logger.info(
+            `voice-chat: speculative.promoted turn=${speculativeTurnId.slice(0, 8)} partial="${preview(speculativeText)}" final="${preview(trimmed)}"`,
+          );
+        }
+        // Reset speculative slots BEFORE awaiting — onPartial fires between
+        // here and the next turn, and we want it free to dispatch again.
+        this.speculativeTurnId = null;
+        this.speculativeText = "";
+        const pending = this.speculativePromise;
+        this.speculativePromise = null;
+        this.currentTurnId = speculativeTurnId;
+        // The agent already ran with `speculativeText`. The user's actual
+        // final is `trimmed` — but since the prefix matched we use the
+        // speculative response. The trailing words the user spoke after the
+        // partial don't get re-prompted; that's the latency win, and the
+        // bet pays off because the prefix is typically the full intent.
+        this.send({ type: "transcript.final", text: trimmed, turnId: speculativeTurnId });
+        // Wait for the speculative dispatch to finish so subsequent turns
+        // (next utterance) don't race with its in-flight reply pipeline.
+        if (pending) await pending;
+        return;
+      }
+      // Reject: prefix didn't match. Abort spec's TTS & buffer, then run
+      // a fresh dispatch on the real final.
+      if (DEBUG) {
+        this.d.logger.info(
+          `voice-chat: speculative.rejected turn=${speculativeTurnId.slice(0, 8)} reason="prefix mismatch" partial="${preview(speculativeText)}" final="${preview(trimmed)}"`,
+        );
+      }
+      this.speculativeTurnId = null;
+      this.speculativeText = "";
+      this.speculativePromise = null;
+      // Tear down the speculative turn's TTS + sentence buffer. The agent
+      // dispatch keeps running but its deliver()s silently no-op once we
+      // delete its sentenceBufs entry (see deliverAgentText).
+      const ac = this.ttsAborts.get(speculativeTurnId);
+      if (ac) ac.abort();
+      this.ttsAborts.delete(speculativeTurnId);
+      const sb = this.sentenceBufs.get(speculativeTurnId);
+      if (sb) sb.close();
+      this.sentenceBufs.delete(speculativeTurnId);
+      this.ttsSeqByTurn.delete(speculativeTurnId);
+      // Fall through to normal dispatch.
+    }
+
     const turnId = randomUUID();
-    const shortId = turnId.slice(0, 8);
     this.currentTurnId = turnId;
+    this.send({ type: "transcript.final", text: trimmed, turnId });
+    await this.runDispatchForTurn(turnId, trimmed);
+  }
+
+  /**
+   * Run a single agent turn end-to-end: set up per-turn TTS state, run the
+   * channel turn, flush, emit agent.done. Shared by real finals and
+   * speculative pre-dispatches — the only difference is that speculative
+   * turns don't send transcript.final (we don't have the real text yet).
+   */
+  private async runDispatchForTurn(turnId: string, text: string): Promise<void> {
+    const shortId = turnId.slice(0, 8);
     this.ttsSeqByTurn.set(turnId, 0);
 
     // Promote pending audio timestamps into the per-turn timing object.
@@ -277,16 +427,14 @@ export class VoiceSession {
       this.turnTimings.set(turnId, timing);
       const sttMs = this._pendingAudioEnd !== null ? tNow - this._pendingAudioEnd : null;
       this.d.logger.info(
-        `voice-chat: transcript.final turn=${shortId} stt_ms=${sttMs ?? "?"} "${preview(trimmed)}"`,
+        `voice-chat: transcript.final turn=${shortId} stt_ms=${sttMs ?? "?"} "${preview(text)}"`,
       );
-      // Reset pending slots for the next utterance.
-      this._pendingAudioStart = null;
-      this._pendingAudioEnd = null;
+      // Don't reset pending audio slots here — they're still valid until the
+      // real final arrives. (For non-speculative turns they'll be reset on
+      // the next speech.start.)
     } else {
-      this.d.logger.info(`voice-chat: transcript.final turn=${shortId} "${preview(trimmed)}"`);
+      this.d.logger.info(`voice-chat: transcript.final turn=${shortId} "${preview(text)}"`);
     }
-
-    this.send({ type: "transcript.final", text: trimmed, turnId });
 
     // Only abort prior turns when TTS is actively producing audio — that's
     // real barge-in (user wants iris to stop). When iris is still thinking
@@ -315,7 +463,7 @@ export class VoiceSession {
 
     const t0 = Date.now();
     try {
-      this.pendingTurn = this.runChannelTurn(trimmed, turnId);
+      this.pendingTurn = this.runChannelTurn(text, turnId);
       await this.pendingTurn;
       sb.flush();
       this.d.logger.info(`voice-chat: agent.done turn=${shortId} duration=${Date.now() - t0}ms`);
@@ -544,6 +692,12 @@ export class VoiceSession {
     for (const sb of this.sentenceBufs.values()) sb.close();
     this.sentenceBufs.clear();
     this.ttsActive = false;
+    // A speculative dispatch is just another turn — its TTS abort lives in
+    // ttsAborts, already cleared above. Drop the bookkeeping so the next
+    // partial can dispatch again.
+    this.speculativeTurnId = null;
+    this.speculativeText = "";
+    this.speculativePromise = null;
   }
 
   /**
@@ -581,6 +735,10 @@ export class VoiceSession {
     if (this.closed) return;
     this.closed = true;
     this.d.logger.info(`voice-chat: session closed client=${this.d.clientId}`);
+    if (this.partialStableTimer) {
+      clearTimeout(this.partialStableTimer);
+      this.partialStableTimer = null;
+    }
     this.interruptTts();
     this.turnTimings.clear();
     void this.stt?.close();
@@ -595,6 +753,7 @@ function preview(s: string, max = 80): string {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length <= max ? t : t.slice(0, max - 1) + "…";
 }
+
 
 /**
  * Loose runtime shape — we don't have a stable importable type for the host

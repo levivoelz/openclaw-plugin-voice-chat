@@ -10,7 +10,17 @@ created the MLX context. To satisfy this, the model is loaded and all
 transcription work happens exclusively on the inference worker thread.
 
 Request  (newline-terminated JSON):
-  {"audio_pcm_b64": "<base64-encoded PCM16 mono>", "sample_rate": 16000}
+  One-shot (non-streaming):
+    {"audio_pcm_b64": "<base64-encoded PCM16 mono>", "sample_rate": 16000}
+    → {"text": "...", "confidence": 0.97}
+
+  Streaming (per-connection state, one streaming context per socket):
+    {"streaming": "start", "sample_rate": 24000}
+      → {"streaming": "started"}
+    {"streaming": "chunk", "audio_pcm_b64": "..."}
+      → {"text": "...", "is_final": false, "confidence": null}
+    {"streaming": "end"}
+      → {"text": "...", "is_final": true, "confidence": 0.96}
 
 Response (newline-terminated JSON):
   {"text": "transcribed text"}          — success
@@ -102,9 +112,30 @@ class InferenceWorker(threading.Thread):
             raise self._load_error
 
     def submit(self, pcm_bytes: bytes, sample_rate: int) -> "Future[str]":
-        """Submit a transcription job. Returns a Future for the result."""
+        """Submit a one-shot transcription job. Returns a Future for the result."""
         fut: Future = Future()
-        self._queue.put((pcm_bytes, sample_rate, fut))
+        self._queue.put(("oneshot", (pcm_bytes, sample_rate), fut))
+        return fut
+
+    def submit_stream_start(self, sample_rate: int) -> "Future":
+        """Allocate a streaming context bound to `sample_rate`. The returned
+        Future resolves to an opaque stream handle (a dict the worker mutates)."""
+        fut: Future = Future()
+        self._queue.put(("stream_start", (sample_rate,), fut))
+        return fut
+
+    def submit_stream_chunk(self, handle: dict, pcm_bytes: bytes) -> "Future[dict]":
+        """Feed a chunk of PCM16 mono audio to an open streaming context.
+        Resolves to {"text": <latest partial>}."""
+        fut: Future = Future()
+        self._queue.put(("stream_chunk", (handle, pcm_bytes), fut))
+        return fut
+
+    def submit_stream_end(self, handle: dict) -> "Future[dict]":
+        """Finalize and tear down a streaming context.
+        Resolves to {"text": <final>, "confidence": <float|None>}."""
+        fut: Future = Future()
+        self._queue.put(("stream_end", (handle,), fut))
         return fut
 
     def run(self):
@@ -125,14 +156,107 @@ class InferenceWorker(threading.Thread):
 
         self._ready.set()
 
+        # Import deps lazily on the worker thread.
+        import numpy as np
+        import mlx.core as mx
+        try:
+            import soxr  # high-quality streaming resampler
+            self._soxr = soxr
+        except ImportError:
+            self._soxr = None
+        self._np = np
+        self._mx = mx
+        self._model_sample_rate = int(self._model.preprocessor_config.sample_rate)
+
         # ── Inference loop ───────────────────────────────────────────────
         while True:
-            pcm_bytes, sample_rate, fut = self._queue.get()
+            op, args, fut = self._queue.get()
             try:
-                result = self._transcribe(pcm_bytes, sample_rate)
-                fut.set_result(result)
+                if op == "oneshot":
+                    pcm_bytes, sample_rate = args
+                    fut.set_result(self._transcribe(pcm_bytes, sample_rate))
+                elif op == "stream_start":
+                    (sample_rate,) = args
+                    fut.set_result(self._stream_start(sample_rate))
+                elif op == "stream_chunk":
+                    handle, pcm_bytes = args
+                    fut.set_result(self._stream_chunk(handle, pcm_bytes))
+                elif op == "stream_end":
+                    (handle,) = args
+                    fut.set_result(self._stream_end(handle))
+                else:
+                    fut.set_exception(ValueError(f"unknown op: {op}"))
             except Exception as exc:
                 fut.set_exception(exc)
+
+    # ── Streaming helpers (worker thread) ────────────────────────────────
+    def _stream_start(self, sample_rate: int) -> dict:
+        """Open a StreamingParakeet context and stash it in an opaque handle."""
+        ctx = self._model.transcribe_stream()
+        # Manually enter the context manager (we hold the state across queue ops).
+        ctx.__enter__()
+        handle = {
+            "ctx": ctx,
+            "in_sr": int(sample_rate),
+            "model_sr": self._model_sample_rate,
+            "resampler": None,
+            "_resample_ratio": (
+                self._model_sample_rate / float(sample_rate) if sample_rate else 1.0
+            ),
+            "last_text": "",
+        }
+        # Allocate a streaming resampler if we need one and soxr is available.
+        if handle["in_sr"] != handle["model_sr"]:
+            if self._soxr is None:
+                ctx.__exit__(None, None, None)
+                raise RuntimeError(
+                    f"streaming needs sample_rate={handle['model_sr']} or soxr installed"
+                )
+            handle["resampler"] = self._soxr.ResampleStream(
+                handle["in_sr"], handle["model_sr"], 1, dtype="float32"
+            )
+        return handle
+
+    def _stream_chunk(self, handle: dict, pcm_bytes: bytes) -> dict:
+        """Feed PCM16 mono bytes; return the latest partial transcript."""
+        np = self._np
+        mx = self._mx
+        if len(pcm_bytes) < 2:
+            return {"text": handle["last_text"], "is_final": False}
+        # PCM16 little-endian → float32 in [-1, 1].
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if handle["resampler"] is not None:
+            audio = handle["resampler"].resample_chunk(audio)
+        if audio.size == 0:
+            return {"text": handle["last_text"], "is_final": False}
+        handle["ctx"].add_audio(mx.array(audio))
+        text = (handle["ctx"].result.text or "").strip()
+        handle["last_text"] = text
+        return {"text": text, "is_final": False}
+
+    def _stream_end(self, handle: dict) -> dict:
+        """Flush the resampler, drain final tokens, tear down the context."""
+        np = self._np
+        mx = self._mx
+        try:
+            if handle["resampler"] is not None:
+                # Flush trailing samples out of the resampler.
+                tail = handle["resampler"].resample_chunk(
+                    np.zeros(0, dtype=np.float32), last=True
+                )
+                if tail.size > 0:
+                    handle["ctx"].add_audio(mx.array(tail))
+            result = handle["ctx"].result
+            text = (result.text or "").strip()
+            confidence = _avg_confidence(result)
+            return {"text": text, "is_final": True, "confidence": confidence}
+        finally:
+            try:
+                handle["ctx"].__exit__(None, None, None)
+            except Exception:
+                pass
+            handle["ctx"] = None
+            handle["resampler"] = None
 
     def _transcribe(self, pcm_bytes: bytes, sample_rate: int) -> dict:
         """Write a temp WAV, run model.transcribe(), return {text, confidence}.
@@ -183,6 +307,8 @@ def _avg_confidence(result) -> float | None:
 # ---------------------------------------------------------------------------
 def handle_connection(conn: socket.socket, worker: InferenceWorker, addr: str):
     log.debug("client connected addr=%s", addr)
+    # Per-connection streaming state: at most one open StreamingParakeet handle.
+    state = {"stream_handle": None}
     try:
         buf = b""
         while True:
@@ -194,12 +320,19 @@ def handle_connection(conn: socket.socket, worker: InferenceWorker, addr: str):
                 line, buf = buf.split(b"\n", 1)
                 line = line.strip()
                 if line:
-                    _handle_request(conn, worker, line)
+                    _handle_request(conn, worker, line, state)
     except (ConnectionResetError, BrokenPipeError):
         pass
     except Exception as exc:
         log.warning("Connection error addr=%s: %s", addr, exc)
     finally:
+        # Free any dangling streaming context (client disconnected mid-utterance).
+        if state["stream_handle"] is not None:
+            try:
+                worker.submit_stream_end(state["stream_handle"]).result(timeout=10)
+            except Exception:
+                pass
+            state["stream_handle"] = None
         try:
             conn.close()
         except OSError:
@@ -207,11 +340,17 @@ def handle_connection(conn: socket.socket, worker: InferenceWorker, addr: str):
         log.debug("client disconnected addr=%s", addr)
 
 
-def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes):
+def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes, state: dict):
     try:
         req = json.loads(raw)
     except json.JSONDecodeError as exc:
         _send_json(conn, {"error": f"invalid JSON: {exc}"})
+        return
+
+    # ── Streaming protocol ─────────────────────────────────────────────────
+    streaming_op = req.get("streaming")
+    if streaming_op is not None:
+        _handle_streaming(conn, worker, req, state, streaming_op)
         return
 
     audio_b64 = req.get("audio_pcm_b64")
@@ -253,6 +392,71 @@ def _handle_request(conn: socket.socket, worker: InferenceWorker, raw: bytes):
         tb_summary = traceback.format_exc().splitlines()[-1]
         log.warning("req error bytes=%d sr=%d err=%s tb=%s", n_bytes, sample_rate, exc, tb_summary)
         _send_json(conn, {"error": str(exc)})
+
+
+def _handle_streaming(
+    conn: socket.socket,
+    worker: InferenceWorker,
+    req: dict,
+    state: dict,
+    op: str,
+):
+    if op == "start":
+        if state["stream_handle"] is not None:
+            _send_json(conn, {"error": "stream already started on this connection"})
+            return
+        sample_rate = int(req.get("sample_rate", 16000))
+        try:
+            handle = worker.submit_stream_start(sample_rate).result(timeout=30)
+            state["stream_handle"] = handle
+            _send_json(conn, {"streaming": "started"})
+        except Exception as exc:
+            _send_json(conn, {"error": f"stream start failed: {exc}"})
+        return
+
+    if op == "chunk":
+        handle = state["stream_handle"]
+        if handle is None:
+            _send_json(conn, {"error": "no active stream; send streaming=start first"})
+            return
+        audio_b64 = req.get("audio_pcm_b64")
+        if not audio_b64:
+            _send_json(conn, {"error": "missing audio_pcm_b64"})
+            return
+        try:
+            pcm_bytes = base64.b64decode(audio_b64)
+        except Exception as exc:
+            _send_json(conn, {"error": f"base64 decode failed: {exc}"})
+            return
+        try:
+            result = worker.submit_stream_chunk(handle, pcm_bytes).result(timeout=60)
+            _send_json(conn, {
+                "text": result["text"],
+                "is_final": False,
+                "confidence": None,
+            })
+        except Exception as exc:
+            _send_json(conn, {"error": f"stream chunk failed: {exc}"})
+        return
+
+    if op == "end":
+        handle = state["stream_handle"]
+        if handle is None:
+            _send_json(conn, {"error": "no active stream"})
+            return
+        state["stream_handle"] = None
+        try:
+            result = worker.submit_stream_end(handle).result(timeout=60)
+            _send_json(conn, {
+                "text": result["text"],
+                "is_final": True,
+                "confidence": result.get("confidence"),
+            })
+        except Exception as exc:
+            _send_json(conn, {"error": f"stream end failed: {exc}"})
+        return
+
+    _send_json(conn, {"error": f"unknown streaming op: {op}"})
 
 
 def _send_json(conn: socket.socket, obj: dict):

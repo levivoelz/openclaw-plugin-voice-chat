@@ -90,3 +90,58 @@ function anySignal(signals: AbortSignal[]): AbortSignal {
   }
   return ctrl.signal;
 }
+
+/**
+ * POST a JSON body to a daemon streaming endpoint. Returns the response body
+ * as an async iterable of raw Uint8Array chunks. The daemon must respond with
+ * Transfer-Encoding: chunked and a binary content type (e.g. audio/mpeg).
+ *
+ * Throws if the HTTP status is not 2xx (reads error body before throwing).
+ */
+export async function* daemonStream(
+  auth: DaemonAuth,
+  path: string,
+  body: unknown,
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): AsyncIterable<Uint8Array> {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 120_000);
+  const compositeSignal = opts.signal
+    ? anySignal([ctrl.signal, opts.signal])
+    : ctrl.signal;
+
+  let res: Response;
+  try {
+    res = await fetch(`${auth.url}${path}`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${auth.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: compositeSignal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!res.ok || res.body === null) {
+    const text = res.body ? await res.text() : "";
+    let parsed: { error?: string; detail?: string } = {};
+    try { parsed = JSON.parse(text); } catch { /* ignore */ }
+    throw new Error(
+      `daemon ${path} ${res.status}: ${parsed.error ?? "error"} ${parsed.detail ?? text.slice(0, 200)}`,
+    );
+  }
+
+  const reader = res.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) yield value;
+    }
+  } finally {
+    reader.cancel().catch(() => {/* ignore */});
+  }
+}
