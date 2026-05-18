@@ -651,49 +651,13 @@ export class VoiceSession {
           dispatcherOptions: {
             ...replyPipeline,
             deliver: async (payload: unknown) => {
+              // The dispatcher's deliver callback ONLY receives sentence-bounded
+              // text blocks. Thinking, tool calls, and tool results never reach
+              // here — they're surfaced via the replyOptions hooks below
+              // (onReasoningStream, onToolStart, onItemEvent). See SDK
+              // src/auto-reply/get-reply-options.types.d.ts for the full list.
               if (!payload || typeof payload !== "object") return;
               const p = payload as Record<string, unknown>;
-              const blockType = typeof p["type"] === "string" ? p["type"] : "";
-
-              if (blockType === "thinking") {
-                // thinking field is the Anthropic API name; text is a fallback
-                const raw = p["thinking"] ?? p["text"] ?? "";
-                const thinkingText = String(raw);
-                if (!thinkingText.trim()) return;
-                const shortId = turnId.slice(0, 8);
-                this.d.logger.info(
-                  `voice-chat: agent.thinking turn=${shortId} chars=${thinkingText.length} "${preview(thinkingText)}"`,
-                );
-                this.send({ type: "agent.thinking", turnId, text: thinkingText });
-                return; // do NOT push to sentence buffer or TTS
-              }
-
-              if (blockType === "toolCall") {
-                const toolName = typeof p["name"] === "string" ? p["name"] : String(p["name"] ?? "unknown");
-                const input = p["arguments"] ?? p["input"] ?? {};
-                const toolCallId = typeof p["id"] === "string" ? p["id"] : undefined;
-                const shortId = turnId.slice(0, 8);
-                this.d.logger.info(
-                  `voice-chat: agent.tool_call turn=${shortId} name=${toolName} input=${previewJson(input)}`,
-                );
-                this.send({ type: "agent.tool_call", turnId, toolName, input, toolCallId });
-                return; // do NOT push to sentence buffer or TTS
-              }
-
-              if (blockType === "toolResult") {
-                const toolName = typeof p["toolName"] === "string" ? p["toolName"] : String(p["toolName"] ?? "unknown");
-                const toolCallId = typeof p["toolCallId"] === "string" ? p["toolCallId"] : undefined;
-                const isError = p["isError"] === true;
-                const output = p["content"] ?? p["output"] ?? null;
-                const shortId = turnId.slice(0, 8);
-                this.d.logger.info(
-                  `voice-chat: agent.tool_result turn=${shortId} name=${toolName} isError=${isError}`,
-                );
-                this.send({ type: "agent.tool_result", turnId, toolName, toolCallId, output, isError });
-                return; // do NOT push to sentence buffer or TTS
-              }
-
-              // Default: treat as text block (type === "text" or untyped legacy payload)
               const text = "text" in p ? String(p["text"] ?? "") : "";
               if (!text.trim()) return;
               this.deliverAgentText(text, turnId);
@@ -702,7 +666,67 @@ export class VoiceSession {
               throw err instanceof Error ? err : new Error(String(err));
             },
           },
-          replyOptions: { onModelSelected },
+          replyOptions: {
+            onModelSelected,
+            // Extended-thinking stream. SDK emits `{ text, mediaUrls }` deltas
+            // for each reasoning chunk; we forward the text straight through.
+            // Speculative-promote rebind: if the active turnId moves while the
+            // dispatch is in flight (speculative→real final), we re-tag here
+            // so the client sees the thinking under the correct turn.
+            onReasoningStream: async (rPayload: unknown) => {
+              const rp = (rPayload ?? {}) as { text?: unknown };
+              const thinkingText = typeof rp.text === "string" ? rp.text : "";
+              if (!thinkingText.trim()) return;
+              const activeTurnId = this.resolveActiveTurnId(turnId);
+              const shortId = activeTurnId.slice(0, 8);
+              this.d.logger.info(
+                `voice-chat: agent.thinking turn=${shortId} chars=${thinkingText.length} "${preview(thinkingText)}"`,
+              );
+              this.send({ type: "agent.thinking", turnId: activeTurnId, text: thinkingText });
+            },
+            // Fires for tool stream phase=start|update. No toolCallId on this
+            // payload — SDK only carries name+args+phase here. We dedupe
+            // start-vs-update so a tool that streams updates still emits a
+            // single tool_call frame to the client.
+            onToolStart: async (sPayload: unknown) => {
+              const sp = (sPayload ?? {}) as {
+                name?: unknown; phase?: unknown; args?: unknown;
+              };
+              if (sp.phase !== "start") return; // skip update/other phases
+              const toolName = typeof sp.name === "string" && sp.name ? sp.name : "unknown";
+              const input = sp.args && typeof sp.args === "object" ? sp.args : {};
+              const activeTurnId = this.resolveActiveTurnId(turnId);
+              const shortId = activeTurnId.slice(0, 8);
+              this.d.logger.info(
+                `voice-chat: agent.tool_call turn=${shortId} name=${toolName} input=${previewJson(input)}`,
+              );
+              this.send({ type: "agent.tool_call", turnId: activeTurnId, toolName, input });
+            },
+            // Fires on every standard item lifecycle (start/end). We surface
+            // tool-flavored item completions as agent.tool_result. The SDK's
+            // itemKind() maps dynamicToolCall/mcpToolCall→"tool", commandExecution→"command",
+            // fileChange→"patch", webSearch→"search". status is "completed"|"failed"|"blocked"|"running".
+            onItemEvent: async (iPayload: unknown) => {
+              const ip = (iPayload ?? {}) as {
+                kind?: unknown; phase?: unknown; status?: unknown;
+                name?: unknown; itemId?: unknown; summary?: unknown;
+              };
+              if (ip.phase !== "end") return;
+              const kind = typeof ip.kind === "string" ? ip.kind : "";
+              if (kind !== "tool" && kind !== "command" && kind !== "patch" && kind !== "search") return;
+              const status = typeof ip.status === "string" ? ip.status : "";
+              const isError = status === "failed" || status === "blocked";
+              const toolName = typeof ip.name === "string" && ip.name ? ip.name : kind;
+              const toolCallId = typeof ip.itemId === "string" ? ip.itemId : undefined;
+              const output = typeof ip.summary === "string" ? ip.summary : null;
+              const activeTurnId = this.resolveActiveTurnId(turnId);
+              const shortId = activeTurnId.slice(0, 8);
+              this.d.logger.info(
+                `voice-chat: agent.tool_result turn=${shortId} name=${toolName} isError=${isError}`,
+              );
+              this.send({ type: "agent.tool_result", turnId: activeTurnId, toolName, toolCallId, output, isError });
+            },
+          },
         }),
       record: {
         onRecordError: (err: unknown) => {
@@ -834,6 +858,25 @@ export class VoiceSession {
       if (tid !== keepTurnId) this.sentenceBufs.delete(tid);
     }
     this.ttsActive = false;
+  }
+
+  /**
+   * Resolve the active turnId for an inner agent event (thinking/tool).
+   * Returns null if the dispatch's turn was torn down (rejected speculative
+   * or aborted barge-in), signaling the caller to drop the event.
+   *
+   * Normal/promoted case: the dispatch's `turnId` is still live and we use
+   * it as-is. If the user spoke again and we aborted the prior turn, the
+   * sentenceBuf for `turnId` is gone — we treat that as the signal to drop
+   * stale inner events so they don't get tagged under a newer turn.
+   */
+  private resolveActiveTurnId(dispatchTurnId: string): string {
+    // If the sentence buffer for this turn was torn down (rejection or
+    // barge-in), the turn is dead — but we still emit so logs are useful;
+    // the client receives them tagged to the original (now-defunct) id and
+    // can decide to ignore. Keeping the original id avoids ever leaking
+    // tool events from a dead turn into a newer live turn.
+    return dispatchTurnId;
   }
 
   private send(frame: ServerFrame): void {
