@@ -288,12 +288,14 @@ export class VoiceSession {
 
     this.send({ type: "transcript.final", text: trimmed, turnId });
 
-    // A new transcript supersedes any prior turn — abort its TTS streams and
-    // drop its sentence buffer so leftover text from the previous LLM dispatch
-    // can't bleed into this turn. The prior agent dispatch may still finish in
-    // the background, but its late deliveries land in a now-missing buffer
-    // entry (deliverAgentText silently no-ops) instead of corrupting this turn.
-    this.abortPriorTurns(turnId);
+    // Only abort prior turns when TTS is actively producing audio — that's
+    // real barge-in (user wants iris to stop). When iris is still thinking
+    // (no audio yet), let the prior turn play through. Otherwise back-to-back
+    // utterances both get silently dropped: the OpenClaw runtime serializes
+    // dispatches per sessionKey and merges multiple pending user messages
+    // into a single LLM cycle, delivering all replies under the older turn's
+    // id — and if we've aborted that turn's buffer, none of them play.
+    if (this.ttsActive) this.abortPriorTurns(turnId);
 
     const ttsProv = this.d.registry.getTts(this.d.config.tts.provider)!;
     const ttsAbort = new AbortController();
