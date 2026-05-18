@@ -3,6 +3,7 @@
  */
 
 import readline from "node:readline";
+import { spawn } from "node:child_process";
 import { WebSocket } from "ws";
 import type { AudioFormat, CaptureMode, ServerFrame } from "../types.js";
 import { VOICE_PROTOCOL_VERSION } from "../types.js";
@@ -33,6 +34,8 @@ export type TalkOptions = {
   noTts:       boolean;
   noStt:       boolean;
   print:       boolean;
+  /** 'voice' plays a brief sci-fi cue on first thinking/tool event per turn. */
+  audioCues:   "voice" | "off";
   deviceToken?: string;
   debug:       boolean;
 };
@@ -69,6 +72,26 @@ export async function talk(opts: TalkOptions): Promise<void> {
   // Per-turn debug timing for client side.
   const ttsFirstChunkAt = new Map<string, number>();  // turnId -> timestamp of first chunk
   let lastSpeechEndAt: number | null = null;
+  // Audio cue tracking — at most one "working" cue per turn, and never if
+  // iris's real TTS is already playing (we'd talk over her).
+  const cuedTurns = new Set<string>();
+
+  function playAudioCue(turnId: string): void {
+    if (opts.audioCues !== "voice") return;
+    if (cuedTurns.has(turnId)) return;
+    if (activePlayer) return;  // iris's TTS is playing — don't compete
+    cuedTurns.add(turnId);
+    // `say -v Trinoids` is the sci-fi/robot voice on macOS. If Trinoids
+    // isn't installed, `say` falls back to the system default. -r sets the
+    // rate (180 wpm = slightly fast, fits "working" in ~400ms).
+    // Linux fallback: spd-say or espeak. Both fire-and-forget.
+    try {
+      const cmd = process.platform === "darwin"
+        ? spawn("say", ["-v", "Trinoids", "-r", "180", "working"], { stdio: "ignore" })
+        : spawn("spd-say", ["-r", "30", "working"], { stdio: "ignore" });
+      cmd.on("error", () => { /* command not found — silently skip */ });
+    } catch { /* spawn failed — skip */ }
+  }
 
   // Play a buffered audio chunk for `turnId`. Chained via `playChain` so
   // consecutive calls queue instead of cancelling each other.
@@ -210,6 +233,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
           break;
 
         case "agent.thinking":
+          playAudioCue(frame.turnId);
           if (opts.print) {
             const preview = frame.text.length > 120 ? frame.text.slice(0, 119) + "…" : frame.text;
             process.stderr.write(`${ANSI_DIM}[thinking] ${preview}${ANSI_RESET}\n`);
@@ -220,6 +244,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
           break;
 
         case "agent.tool_call": {
+          playAudioCue(frame.turnId);
           const shortInput = (() => {
             try { const s = JSON.stringify(frame.input); return s.length > 80 ? s.slice(0, 79) + "…" : s; }
             catch { return String(frame.input); }

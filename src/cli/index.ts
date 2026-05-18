@@ -38,6 +38,9 @@ Options:
   --no-tts                Transcript-only, skip audio playback
   --no-stt                Type input instead of speaking
   --print                 Echo transcripts and replies to stderr/stdout
+  --audio-cues <mode>     'voice' (default) plays a brief sci-fi cue ("working")
+                          on the first thinking/tool event of each turn so you
+                          know iris is alive during long waits. 'off' disables.
   --device-token <tok>    Auth token (or \$OPENCLAW_DEVICE_TOKEN)
   --debug                 Verbose logging
   --help, -h              Show this help
@@ -122,6 +125,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const rawAudioCues = arg(argv, "--audio-cues") ?? "voice";
+  if (rawAudioCues !== "voice" && rawAudioCues !== "off") {
+    process.stderr.write(`Invalid --audio-cues "${rawAudioCues}". Must be voice or off.\n`);
+    process.exit(1);
+  }
+
   const talkOpts: TalkOptions = {
     gateway,
     agentId:     arg(argv, "--agent"),
@@ -138,6 +147,7 @@ async function main(): Promise<void> {
     noTts:       hasFlag(argv, "--no-tts"),
     noStt:       hasFlag(argv, "--no-stt"),
     print:       hasFlag(argv, "--print"),
+    audioCues:   rawAudioCues as "voice" | "off",
     deviceToken,
     debug,
   };
