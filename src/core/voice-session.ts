@@ -43,6 +43,13 @@ const DEBUG = !!process.env["VOICE_CHAT_DEBUG"];
 const SPECULATIVE_MIN_CHARS = 10;          // skip noise / single-word partials
 const SPECULATIVE_STABILITY_MS = 300;      // partial must be unchanged this long
 
+// Utterance stitching: after a final transcript arrives, wait this long for
+// another to land. If one does (user paused mid-thought), append and reset
+// the timer instead of dispatching N separate turns. The VAD stays snappy
+// (250ms offset) so we still detect end-of-speech fast, but we don't commit
+// to a dispatch until the user has been quiet for the stitch window.
+const UTTERANCE_STITCH_MS = 800;
+
 type TurnTiming = {
   audioStart: number;
   audioEnd: number | null;
@@ -121,6 +128,10 @@ export class VoiceSession {
   // isn't actively revising its guess.
   private lastPartialText = "";
   private partialStableTimer: ReturnType<typeof setTimeout> | null = null;
+  // ── Utterance stitching ───────────────────────────────────────────────
+  // Buffered final transcript awaiting the stitch window. Cleared on dispatch.
+  private pendingFinalText = "";
+  private pendingFinalTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: VoiceSessionDeps) {
     this.ws = deps.ws;
@@ -222,7 +233,8 @@ export class VoiceSession {
         break;
       }
       case "text":
-        void this.onFinalTranscript(frame.content);
+        // Typed input is a complete message — bypass stitching.
+        void this.dispatchFinalTranscript(frame.content);
         break;
       case "interrupt":
         this.interruptTts();
@@ -325,7 +337,49 @@ export class VoiceSession {
       .catch(() => { /* errors are logged inside runDispatchForTurn */ });
   }
 
-  private async onFinalTranscript(text: string): Promise<void> {
+  /**
+   * STT delivered a finalized utterance. Buffer it and wait
+   * UTTERANCE_STITCH_MS for another to arrive — if one does (user paused
+   * mid-thought), append the text and reset the timer. Only fires the real
+   * dispatch when the gap exceeds the stitch window. Skipped during real
+   * barge-in (ttsActive) so interruptions hit the agent immediately.
+   */
+  private onFinalTranscript(text: string): void {
+    if (this.closed) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    // Barge-in path: dispatch immediately, flushing any pending stitch.
+    if (this.ttsActive) {
+      const pending = this.flushStitchBuffer();
+      const combined = pending ? `${pending} ${trimmed}` : trimmed;
+      void this.dispatchFinalTranscript(combined);
+      return;
+    }
+
+    // Append to the stitch buffer and (re)set the gap timer.
+    this.pendingFinalText = this.pendingFinalText
+      ? `${this.pendingFinalText} ${trimmed}`
+      : trimmed;
+    if (this.pendingFinalTimer) clearTimeout(this.pendingFinalTimer);
+    this.pendingFinalTimer = setTimeout(() => {
+      const stitched = this.flushStitchBuffer();
+      if (stitched) void this.dispatchFinalTranscript(stitched);
+    }, UTTERANCE_STITCH_MS);
+  }
+
+  /** Drain and clear the stitch buffer. Returns the buffered text. */
+  private flushStitchBuffer(): string {
+    const text = this.pendingFinalText;
+    this.pendingFinalText = "";
+    if (this.pendingFinalTimer) {
+      clearTimeout(this.pendingFinalTimer);
+      this.pendingFinalTimer = null;
+    }
+    return text;
+  }
+
+  private async dispatchFinalTranscript(text: string): Promise<void> {
     if (this.closed) return;
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -577,10 +631,50 @@ export class VoiceSession {
           dispatcherOptions: {
             ...replyPipeline,
             deliver: async (payload: unknown) => {
-              const text =
-                payload && typeof payload === "object" && "text" in (payload as Record<string, unknown>)
-                  ? String((payload as { text?: unknown }).text ?? "")
-                  : "";
+              if (!payload || typeof payload !== "object") return;
+              const p = payload as Record<string, unknown>;
+              const blockType = typeof p["type"] === "string" ? p["type"] : "";
+
+              if (blockType === "thinking") {
+                // thinking field is the Anthropic API name; text is a fallback
+                const raw = p["thinking"] ?? p["text"] ?? "";
+                const thinkingText = String(raw);
+                if (!thinkingText.trim()) return;
+                const shortId = turnId.slice(0, 8);
+                this.d.logger.info(
+                  `voice-chat: agent.thinking turn=${shortId} chars=${thinkingText.length} "${preview(thinkingText)}"`,
+                );
+                this.send({ type: "agent.thinking", turnId, text: thinkingText });
+                return; // do NOT push to sentence buffer or TTS
+              }
+
+              if (blockType === "toolCall") {
+                const toolName = typeof p["name"] === "string" ? p["name"] : String(p["name"] ?? "unknown");
+                const input = p["arguments"] ?? p["input"] ?? {};
+                const toolCallId = typeof p["id"] === "string" ? p["id"] : undefined;
+                const shortId = turnId.slice(0, 8);
+                this.d.logger.info(
+                  `voice-chat: agent.tool_call turn=${shortId} name=${toolName} input=${previewJson(input)}`,
+                );
+                this.send({ type: "agent.tool_call", turnId, toolName, input, toolCallId });
+                return; // do NOT push to sentence buffer or TTS
+              }
+
+              if (blockType === "toolResult") {
+                const toolName = typeof p["toolName"] === "string" ? p["toolName"] : String(p["toolName"] ?? "unknown");
+                const toolCallId = typeof p["toolCallId"] === "string" ? p["toolCallId"] : undefined;
+                const isError = p["isError"] === true;
+                const output = p["content"] ?? p["output"] ?? null;
+                const shortId = turnId.slice(0, 8);
+                this.d.logger.info(
+                  `voice-chat: agent.tool_result turn=${shortId} name=${toolName} isError=${isError}`,
+                );
+                this.send({ type: "agent.tool_result", turnId, toolName, toolCallId, output, isError });
+                return; // do NOT push to sentence buffer or TTS
+              }
+
+              // Default: treat as text block (type === "text" or untyped legacy payload)
+              const text = "text" in p ? String(p["text"] ?? "") : "";
               if (!text.trim()) return;
               this.deliverAgentText(text, turnId);
             },
@@ -739,6 +833,7 @@ export class VoiceSession {
       clearTimeout(this.partialStableTimer);
       this.partialStableTimer = null;
     }
+    this.flushStitchBuffer();
     this.interruptTts();
     this.turnTimings.clear();
     void this.stt?.close();
@@ -754,6 +849,14 @@ function preview(s: string, max = 80): string {
   return t.length <= max ? t : t.slice(0, max - 1) + "…";
 }
 
+function previewJson(value: unknown, max = 120): string {
+  try {
+    const s = JSON.stringify(value);
+    return s.length <= max ? s : s.slice(0, max - 1) + "…";
+  } catch {
+    return String(value);
+  }
+}
 
 /**
  * Loose runtime shape — we don't have a stable importable type for the host

@@ -40,6 +40,9 @@ export type ServerFrame =
   | { type: "transcript.final"; text: string; turnId: string }
   | { type: "agent.delta"; text: string; turnId: string }
   | { type: "agent.done"; turnId: string; usage?: Record<string, unknown> }
+  | { type: "agent.thinking"; turnId: string; text: string }
+  | { type: "agent.tool_call"; turnId: string; toolName: string; input: unknown; toolCallId?: string }
+  | { type: "agent.tool_result"; turnId: string; toolName: string; toolCallId?: string; output: unknown; isError?: boolean }
   | { type: "tts.chunk"; turnId: string; seq: number; format: AudioFormat }
   | { type: "tts.done"; turnId: string }
   | { type: "error"; code: VoiceErrorCode; message: string; recoverable?: boolean }

@@ -11,6 +11,7 @@ import { resolveClientId } from "./client-id.js";
 
 const ANSI_DIM    = "\x1b[2m";
 const ANSI_RESET  = "\x1b[0m";
+const ANSI_YELLOW = "\x1b[33m";
 
 type AudioMod = typeof import("./audio-mac.js");
 
@@ -207,6 +208,41 @@ export async function talk(opts: TalkOptions): Promise<void> {
         case "agent.done":
           if (opts.print) process.stdout.write("\n");
           break;
+
+        case "agent.thinking":
+          if (opts.print) {
+            const preview = frame.text.length > 120 ? frame.text.slice(0, 119) + "…" : frame.text;
+            process.stderr.write(`${ANSI_DIM}[thinking] ${preview}${ANSI_RESET}\n`);
+          }
+          if (opts.debug) {
+            process.stderr.write(`${ANSI_DIM}[thinking] (full)\n${frame.text}${ANSI_RESET}\n`);
+          }
+          break;
+
+        case "agent.tool_call": {
+          const shortInput = (() => {
+            try { const s = JSON.stringify(frame.input); return s.length > 80 ? s.slice(0, 79) + "…" : s; }
+            catch { return String(frame.input); }
+          })();
+          if (opts.print) {
+            process.stderr.write(`${ANSI_YELLOW}[tool] ${frame.toolName}(${shortInput})${ANSI_RESET}\n`);
+          }
+          if (opts.debug) {
+            process.stderr.write(`[debug] tool_call name=${frame.toolName} id=${frame.toolCallId ?? "?"} input=${JSON.stringify(frame.input, null, 2)}\n`);
+          }
+          break;
+        }
+
+        case "agent.tool_result": {
+          const mark = frame.isError ? "✗" : "✓";
+          if (opts.print) {
+            process.stderr.write(`${ANSI_YELLOW}[tool ${mark}] ${frame.toolName}${ANSI_RESET}\n`);
+          }
+          if (opts.debug) {
+            process.stderr.write(`[debug] tool_result name=${frame.toolName} id=${frame.toolCallId ?? "?"} isError=${frame.isError ?? false} output=${JSON.stringify(frame.output, null, 2)}\n`);
+          }
+          break;
+        }
 
         case "tts.chunk": {
           if (opts.noTts) break;
