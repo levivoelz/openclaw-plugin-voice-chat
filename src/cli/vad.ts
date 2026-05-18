@@ -35,7 +35,7 @@ export type VadOptions = {
 const VAD_TRACE = process.env["VOICE_CHAT_DEBUG"] === "vad";
 
 const DEFAULTS: Required<VadOptions> = {
-  sampleRate: 24000,
+  sampleRate: 16000,
   // Lowered from 0.03 to admit quieter speech (laptop mics across rooms,
   // soft-spoken users). We rely on parakeet's per-token confidence
   // (minConfidence=0.85 default in the STT provider) as the hallucination

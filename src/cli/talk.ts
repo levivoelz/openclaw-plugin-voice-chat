@@ -152,7 +152,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
       protocol: VOICE_PROTOCOL_VERSION,
       mode: opts.mode,
       codec: "pcm16",
-      sampleRate: 24000,
+      sampleRate: 16000,
       sttHints: { provider: opts.stt, model: opts.sttModel },
       ttsHints: {
         provider: opts.tts,
@@ -414,7 +414,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
 
-    const VAD_SAMPLE_RATE = 24000;
+    const VAD_SAMPLE_RATE = 16000;
     const recorder = startVadRecording({
       sampleRate: VAD_SAMPLE_RATE,
       onUtterance: (pcm) => {

@@ -21,7 +21,7 @@ function mapFormat(fmt: AudioFormat): string {
   return fmt;
 }
 
-const MIN_YIELD_BYTES = 4096; // don't yield chunks smaller than 4 KB (reduces WS overhead)
+const MIN_YIELD_BYTES = 1024; // don't yield chunks smaller than 1 KB (reduces first-chunk latency)
 
 async function* synthesize(req: TtsSynthesizeRequest): AsyncIterable<TtsStreamChunk> {
   const auth = resolveDaemonAuth(req.providerConfig);

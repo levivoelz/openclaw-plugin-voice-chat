@@ -29,8 +29,8 @@ import { getVoiceChatRuntime } from "../channel-runtime.js";
 // we still access via runtime.channel.reply).
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 
-// 24 kHz: minimum accepted by OpenAI Realtime, also fine for Whisper.
-const SAMPLE_RATE = 24_000;
+// 16 kHz: Parakeet's native preprocessor rate; no resampling needed.
+const SAMPLE_RATE = 16_000;
 const CHANNEL_ID = "voice-chat";
 
 // Debug timing — only active when VOICE_CHAT_DEBUG is set.
@@ -197,6 +197,26 @@ export class VoiceSession {
     this.d.logger.info(
       `voice-chat: session ready agent=${this.d.agentId} client=${this.d.clientId} stt=${sttProv.id} tts=${ttsProv.id}/${this.d.config.tts.voice ?? "?"}`,
     );
+
+    this.prewarmTts(ttsProv).catch(() => { /* prewarm failures are non-fatal */ });
+  }
+
+  private async prewarmTts(
+    ttsProv: ReturnType<ProviderRegistry["getTts"]> extends infer P ? NonNullable<P> : never,
+  ): Promise<void> {
+    try {
+      const stream = ttsProv.synthesize({
+        text: ".",
+        model: this.d.config.tts.model,
+        voice: this.d.config.tts.voice,
+        format: this.d.config.tts.format,
+        providerConfig: this.d.pluginConfig,
+        signal: new AbortController().signal,
+      });
+      // Drain and discard.
+      for await (const _ of stream) { /* discard */ }
+      if (DEBUG) this.d.logger.info(`voice-chat: tts.prewarmed`);
+    } catch { /* non-fatal */ }
   }
 
   handleFrame(frame: ClientFrame): void {
@@ -221,8 +241,8 @@ export class VoiceSession {
         void this.stt?.endUtterance();
         if (DEBUG) {
           this._pendingAudioEnd = nowMs();
-          // Compute audio duration from actual bytes received (24 kHz mono PCM16:
-          // sample_rate=24000, bytes_per_sample=2 → bytes / 48000 * 1000 ms).
+          // Compute audio duration from actual bytes received (16 kHz mono PCM16:
+          // sample_rate=16000, bytes_per_sample=2 → bytes / 32000 * 1000 ms).
           const audioMs = this._pendingAudioBytes > 0
             ? Math.round(this._pendingAudioBytes / (SAMPLE_RATE * 2) * 1000)
             : null;
