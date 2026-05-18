@@ -70,6 +70,13 @@ export class Vad {
   private chunks: Buffer[] = [];
   private preRoll: Buffer[] = [];
   private peakRms = 0;         // max RMS observed during current SPEECH
+  // When TTS is actively playing through speakers near the mic, raise the
+  // VAD bar so the speaker bleed doesn't trigger phantom turns. The user
+  // can still barge in by speaking louder than iris's playback level.
+  // 3x multiplier was tuned against laptop-speaker bleed; closed-back
+  // headphones make this a no-op since there's no loop.
+  private sensitivityScale = 1;
+  private static readonly DUCK_SCALE = 3;
 
   constructor(onUtterance: (pcm: Buffer) => void, options: VadOptions) {
     this.opts = { ...DEFAULTS, ...options };
@@ -77,9 +84,19 @@ export class Vad {
     this.onUtterance = onUtterance;
   }
 
+  /**
+   * Raise the effective threshold while local TTS playback is active so
+   * the speaker→mic loop doesn't trigger a phantom utterance. User can
+   * still barge in by speaking louder than the playback level.
+   */
+  setSpeakerActive(active: boolean): void {
+    this.sensitivityScale = active ? Vad.DUCK_SCALE : 1;
+  }
+
   push(pcm: Buffer): void {
     const rms = computeRms(pcm);
-    const isSpeech = rms >= this.opts.threshold;
+    const threshold = this.opts.threshold * this.sensitivityScale;
+    const isSpeech = rms >= threshold;
     const bytes = pcm.byteLength;
     if (VAD_TRACE) {
       process.stderr.write(
@@ -131,10 +148,13 @@ export class Vad {
   flush(): void {
     if (this.state === "speech" && this.chunks.length > 0) {
       const utteranceMs = this.utteranceBytes / this.bytesPerMs;
+      const minPeak = this.opts.minPeakRms * this.sensitivityScale;
       // Two gates: minimum duration AND peak energy. The peak gate prevents
       // STT from being fed near-silent audio (room tone clearing `threshold`
       // for the onset window then mostly quiet), which causes confabulation.
-      if (utteranceMs >= this.opts.minUtteranceMs && this.peakRms >= this.opts.minPeakRms) {
+      // During speaker-active mode, the peak gate is also raised so iris's
+      // own playback bleeding through the mic doesn't qualify.
+      if (utteranceMs >= this.opts.minUtteranceMs && this.peakRms >= minPeak) {
         this.onUtterance(Buffer.concat(this.chunks));
       }
     }

@@ -48,7 +48,7 @@ export function startVadRecording(opts: {
   sampleRate: number;
   onUtterance: (pcm: Buffer) => void;
   onError: (e: Error) => void;
-}): { stop: () => void } {
+}): { stop: () => void; setSpeakerActive: (active: boolean) => void } {
   const vad = new Vad(opts.onUtterance, { sampleRate: opts.sampleRate });
 
   const proc = spawn("sox", [
@@ -73,7 +73,10 @@ export function startVadRecording(opts: {
     }
   });
 
-  return { stop: () => killQuietly(proc) };
+  return {
+    stop: () => killQuietly(proc),
+    setSpeakerActive: (active: boolean) => vad.setSpeakerActive(active),
+  };
 }
 
 export async function playAudio(args: {

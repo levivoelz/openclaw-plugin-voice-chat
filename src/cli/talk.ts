@@ -61,6 +61,10 @@ export async function talk(opts: TalkOptions): Promise<void> {
   // sentence). We must play them sequentially — calling startPlayback while
   // a prior one is in flight would abort and cut audio off mid-sentence.
   let playChain: Promise<void> = Promise.resolve();
+  // Set by startVadMode so runPlayback can duck VAD sensitivity during local
+  // playback (prevents the speaker→mic loop from triggering phantom turns
+  // while still allowing barge-in if the user speaks louder than playback).
+  let vadRecorder: { stop: () => void; setSpeakerActive: (a: boolean) => void } | null = null;
   // Per-turn debug timing for client side.
   const ttsFirstChunkAt = new Map<string, number>();  // turnId -> timestamp of first chunk
   let lastSpeechEndAt: number | null = null;
@@ -81,6 +85,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
 
     const ac = new AbortController();
     activePlayer = ac;
+    vadRecorder?.setSpeakerActive(true);
 
     const playbackStart = Date.now();
     if (opts.debug) {
@@ -106,6 +111,11 @@ export async function talk(opts: TalkOptions): Promise<void> {
     } finally {
       if (activePlayer === ac) activePlayer = null;
       ttsFirstChunkAt.delete(turnId);
+      // Keep the duck on for ~250ms after player exits — speaker tail / OS
+      // playback buffer can keep ringing briefly after the process returns.
+      setTimeout(() => {
+        if (!activePlayer) vadRecorder?.setSpeakerActive(false);
+      }, 250);
     }
   }
 
@@ -393,6 +403,7 @@ export async function talk(opts: TalkOptions): Promise<void> {
       },
       onError: (e) => process.stderr.write(`Mic error: ${e.message}\n`),
     });
+    vadRecorder = recorder;
 
     process.stdin.on("keypress", (_str, key: { name?: string; ctrl?: boolean }) => {
       if (!key) return;

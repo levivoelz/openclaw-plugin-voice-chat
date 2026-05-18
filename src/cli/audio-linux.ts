@@ -42,7 +42,11 @@ export function startVadRecording(opts: {
   sampleRate: number;
   onUtterance: (pcm: Buffer) => void;
   onError: (e: Error) => void;
-}): { stop: () => void } {
+}): { stop: () => void; setSpeakerActive: (active: boolean) => void } {
+  // Linux path uses sox's built-in silence detector (server-side amplitude),
+  // so we can't dynamically tighten the gate at runtime the way the JS Vad
+  // class does. setSpeakerActive is a no-op here; users on Linux who hit
+  // speaker bleed should use headphones or a directional mic. (Most do.)
   const proc = spawn("sox", [
     "-d",
     "-t", "raw",
@@ -63,7 +67,10 @@ export function startVadRecording(opts: {
     }
   });
 
-  return { stop: () => killQuietly(proc) };
+  return {
+    stop: () => killQuietly(proc),
+    setSpeakerActive: (_active: boolean) => { /* no-op on linux */ },
+  };
 }
 
 export async function playAudio(args: {
