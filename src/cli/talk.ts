@@ -81,13 +81,13 @@ export async function talk(opts: TalkOptions): Promise<void> {
     if (cuedTurns.has(turnId)) return;
     if (activePlayer) return;  // iris's TTS is playing — don't compete
     cuedTurns.add(turnId);
-    // `say -v Trinoids` is the sci-fi/robot voice on macOS. If Trinoids
-    // isn't installed, `say` falls back to the system default. -r sets the
-    // rate (180 wpm = slightly fast, fits "working" in ~400ms).
-    // Linux fallback: spd-say or espeak. Both fire-and-forget.
+    // `say -v Zarvox` is the flat monotone "computer voice" on macOS —
+    // classic HAL-9000 vibe. If Zarvox isn't installed, `say` falls back
+    // to the system default. -r sets the rate (170 wpm fits "working" in
+    // ~450ms). Linux fallback: spd-say. All fire-and-forget.
     try {
       const cmd = process.platform === "darwin"
-        ? spawn("say", ["-v", "Trinoids", "-r", "180", "working"], { stdio: "ignore" })
+        ? spawn("say", ["-v", "Zarvox", "-r", "170", "working"], { stdio: "ignore" })
         : spawn("spd-say", ["-r", "30", "working"], { stdio: "ignore" });
       cmd.on("error", () => { /* command not found — silently skip */ });
     } catch { /* spawn failed — skip */ }
