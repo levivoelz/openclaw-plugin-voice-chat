@@ -73,10 +73,11 @@ export class Vad {
   // When TTS is actively playing through speakers near the mic, raise the
   // VAD bar so the speaker bleed doesn't trigger phantom turns. The user
   // can still barge in by speaking louder than iris's playback level.
-  // 3x multiplier was tuned against laptop-speaker bleed; closed-back
-  // headphones make this a no-op since there's no loop.
+  // 2x is the sweet spot — 3x was too aggressive and blocked real
+  // barge-in speech. Closed-back headphones make this a no-op since there's
+  // no loop, so over-ducking only hurts speaker users.
   private sensitivityScale = 1;
-  private static readonly DUCK_SCALE = 3;
+  private static readonly DUCK_SCALE = 2;
 
   constructor(onUtterance: (pcm: Buffer) => void, options: VadOptions) {
     this.opts = { ...DEFAULTS, ...options };

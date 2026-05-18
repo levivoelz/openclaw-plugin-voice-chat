@@ -454,6 +454,14 @@ export async function talk(opts: TalkOptions): Promise<void> {
           process.stderr.write(`${ANSI_DIM}[dropped — not connected]${ANSI_RESET}\n`);
           return;
         }
+        // Barge-in: if iris is currently playing, kill local playback AND
+        // discard queued audio chunks. Otherwise queued sentences keep
+        // playing after the server aborts its TTS stream.
+        if (activePlayer) {
+          interruptPlayback();
+          ttsBuffers.clear();
+          playChain = Promise.resolve();
+        }
         safeSend({ type: "speech.start" });
         const CHUNK = 16 * 1024;
         for (let i = 0; i < pcm.byteLength; i += CHUNK) {
